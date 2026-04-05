@@ -80,10 +80,10 @@ if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
     wineserver -k 2>/dev/null || true
     sleep 1
     # Remove real NDIS driver (crashes Wine — we replace it with rvpnnetmp.sys)
-    WINEDEBUG=-all wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f 2>/dev/null || true
+    WINEDEBUG=-all wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
     rm -f "$WINEPREFIX/drive_c/windows/system32/drivers/RvNetMP60.sys"
     # Disable SCM auto-start (we launch via rvpn_launcher /run)
-    WINEDEBUG=-all wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f 2>/dev/null || true
+    WINEDEBUG=-all wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
     wineserver -k 2>/dev/null || true
     sleep 1
     echo "[+] Radmin VPN installed"
@@ -91,6 +91,7 @@ fi
 
 # 3. Install our components
 echo "[*] Installing components..."
+chmod +x "$BUILD_DIR/tap_bridge" 2>/dev/null || true
 cp "$BUILD_DIR/rvpnnetmp.sys" "$WINEPREFIX/drive_c/windows/system32/drivers/"
 cp "$BUILD_DIR/adapter_hook.dll" "$RADMIN/"
 cp "$BUILD_DIR/rvpn_launcher.exe" "$RADMIN/"
