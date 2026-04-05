@@ -2,6 +2,10 @@
 
 Run [Radmin VPN](https://www.radmin-vpn.com/) on Linux via Wine. Join VPN networks, see peers, play games — all without a Windows VM.
 
+> I did not build this because it was easier than a VM. I built it because I thought it was easier than a VM.
+
+**AI-assisted code.** Built collaboratively between a human and Claude (Anthropic). The driver, hooks, and bridge were written with extensive AI-assisted reverse engineering of Radmin VPN's undocumented driver protocol using Ghidra. **This works, but comes with no guarantees.** Not affiliated with Famatech. Radmin VPN is proprietary — download it yourself from [radmin-vpn.com](https://www.radmin-vpn.com/). Use at your own risk.
+
 ## How it works
 
 Radmin VPN's Windows service talks to an NDIS miniport driver for its virtual network adapter. Wine doesn't support NDIS, so we replace the driver with our own implementation that bridges to a Linux TAP device. A hook DLL handles Wine compatibility issues (adapter naming, registry permissions). The result is a fully functional Radmin VPN client running natively under Wine.
@@ -58,7 +62,7 @@ On subsequent runs, just:
 
 ## Building from source
 
-Requires `mingw-w64` cross-compilers. Binaries are also built automatically by CI on every push — grab them from [Releases](https://github.com/baptisterajaut/radmin-vpn-linux/releases) or [Actions artifacts](https://github.com/baptisterajaut/radmin-vpn-linux/actions) if you don't want to install mingw.
+Requires `mingw-w64` cross-compilers. Pre-built binaries are available from [Releases](https://github.com/baptisterajaut/radmin-vpn-linux/releases) (built by CI on each tagged version) if you don't want to install mingw.
 
 ```bash
 make          # build everything to build/
@@ -85,7 +89,7 @@ The wineprefix is stored in `./wineprefix/`. A persistent MAC address is generat
 | Component | Description |
 |---|---|
 | `rvpnnetmp.sys` | Wine kernel driver. Emulates the Radmin NDIS miniport. Handles IOCTLs (VERSION, STATUS, SETUP, PEERMAC), TLV frame encoding/decoding, IRP queue for overlapped I/O, MAC-based frame routing for multi-peer support. |
-| `adapter_hook.dll` | Injected into RvControlSvc.exe. IAT hooks: renames TAP adapter to match Radmin's expected name, no-ops `RegSetKeySecurity` to work around a Wine SCM bug where services lack the SYSTEM SID. |
+| `adapter_hook.dll` | Companion DLL loaded alongside RvControlSvc.exe. IAT hooks: renames TAP adapter to match Radmin's expected name, no-ops `RegSetKeySecurity` to work around a Wine SCM bug where services lack the SYSTEM SID. |
 | `tap_bridge` | Native Linux binary. Relays ethernet frames between the TAP device and named pipes (FIFOs) that the Wine driver reads/writes. |
 | `netsh.exe` | Replaces Wine's netsh stub. Translates Windows `netsh interface ip` commands to Linux `ip addr`/`ip link` commands via a file-based relay. |
 | `rvpn_launcher.exe` | Injects `adapter_hook.dll` into the Radmin service process via `CreateRemoteThread` + `LoadLibrary`. |
@@ -106,11 +110,7 @@ The wineprefix is stored in `./wineprefix/`. A persistent MAC address is generat
 - The `26.0.0.0/8` on-link route affects the entire system while running (cleaned up on exit)
 - Older Wine versions (< 9.0) may have different overlapped I/O behavior that breaks the driver
 
-## Disclaimers
-
-**AI-assisted code.** This project was developed with significant AI assistance (Claude). The driver, hook DLL, and bridge were written collaboratively between a human developer and an AI, with extensive reverse engineering of Radmin VPN's IOCTL protocol and frame format using Ghidra.
-
-**Unsupported.** This is a personal project, not affiliated with Famatech. It works, but there are no guarantees. Radmin VPN is proprietary software — you must download it yourself from [radmin-vpn.com](https://www.radmin-vpn.com/). Use at your own risk.
+## Notes
 
 **Ban risk.** Each fresh wineprefix creates a new registration ID with Famatech's servers. Don't delete and recreate your wineprefix unnecessarily. Reuse it across sessions.
 

@@ -7,3 +7,4 @@ wineprefix/
 tap_bridge
 *.log
 *.o
+.*.kate-swp
