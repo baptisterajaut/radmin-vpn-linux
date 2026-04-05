@@ -174,7 +174,7 @@ static RX_RING g_rx_ring;
  * We queue them FIFO. When a frame arrives, the RX thread dequeues
  * the oldest IRP and completes it with TLV data. Wine delivers the
  * completion to the correct ReadFile caller. This is what the real
- * NDIS miniport driver does (linked list of pending IRPs). */
+ * NDIS miniport driver does (confirmed from RE of NetMP60_1_1_64.sys). */
 
 #define IRP_QUEUE_SIZE 256
 
@@ -973,6 +973,6 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Registry
     DriverObject->MajorFunction[IRP_MJ_WRITE]           = DispatchWrite;
     DriverObject->DriverUnload = Unload;
 
-    drv_log("Driver loaded — TLV data path");
+    drv_log("Driver loaded");
     return STATUS_SUCCESS;
 }

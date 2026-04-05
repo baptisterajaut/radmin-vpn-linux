@@ -102,7 +102,7 @@ int main(int argc, char *argv[])
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Attach to existing TAP (created by run_v14.sh with ip tuntap add) */
+    /* Attach to existing TAP (created by run.sh with ip tuntap add) */
     int tap_fd = open_tap(TAP_DEV_NAME);
     if (tap_fd < 0) return 1;
 
