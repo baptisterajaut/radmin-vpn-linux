@@ -39,7 +39,8 @@ cd radmin-vpn-linux
 
 # Option A: download pre-built binaries from GitHub Releases
 mkdir -p build
-curl -sL https://github.com/baptisterajaut/radmin-vpn-linux/releases/latest/download/radmin-vpn-linux-latest.tar.gz \
+TAG=$(curl -sI https://github.com/baptisterajaut/radmin-vpn-linux/releases/latest | grep -i location | grep -oP 'v[\d.]+')
+curl -sL "https://github.com/baptisterajaut/radmin-vpn-linux/releases/download/${TAG}/radmin-vpn-linux-${TAG}.tar.gz" \
   | tar xz -C build/
 
 # Option B: build from source
