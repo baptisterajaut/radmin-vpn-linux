@@ -24,6 +24,10 @@ rm -rf AppDir dist
 wget --retry-connrefused --tries=30 "$SHARUN" -O ./quick-sharun
 chmod +x ./quick-sharun
 
+# Copy exec
+mkdir -p ./AppDir/bin/build
+cp -v ./*.{dll,exe,sys} ./AppDir/bin/build || :
+
 # Point to your binaries
 ./quick-sharun ./tap_bridge ./run.sh
 
