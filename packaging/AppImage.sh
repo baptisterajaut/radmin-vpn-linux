@@ -14,7 +14,7 @@ export ICON=DUMMY
 export OUTPATH=./dist
 export DEPLOY_OPENGL=0
 export DEPLOY_VULKAN=0
-export DEPLOY_DOTNET=1
+export DEPLOY_DOTNET=0
 
 #Remove leftovers
 rm -rf AppDir dist
