@@ -6,7 +6,10 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export WINEDEBUG="-all"
 # Disable wine-mono + wine-gecko auto-install dialogs — Radmin VPN needs neither.
-export WINEDLLOVERRIDES="mscoree=;mshtml="
+# Force native netsh.exe: wine-staging 11.x loads its builtin netsh stub even when a
+# native PE sits in system32/syswow64, so our wrapper is skipped. "n" (native only)
+# is the one-flag fix that restored IP assignment after the AppImage bundled wine-staging.
+export WINEDLLOVERRIDES="mscoree=;mshtml=;netsh.exe=n"
 # Suppress core dumps from expected transient crashes (Radmin's NDIS driver loading under wine).
 # Keeps systemd-coredump / DrKonqi / apport quiet.
 ulimit -c 0 2>/dev/null || true
