@@ -8,3 +8,4 @@ tap_bridge
 *.log
 *.o
 .*.kate-swp
+packaging/dist/

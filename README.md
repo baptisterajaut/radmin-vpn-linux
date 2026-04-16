@@ -14,11 +14,24 @@ Radmin VPN's Windows service talks to an NDIS miniport driver for its virtual ne
 Linux app ← TAP (radminvpn0) ← tap_bridge ← FIFO ← rvpnnetmp.sys (Wine driver) ← RvControlSvc.exe
 ```
 
-## Prerequisites
+## Quick start (AppImage, recommended)
+
+Grab `RadminVPN-Linux-x86_64.AppImage` from the [latest release](https://github.com/baptisterajaut/radmin-vpn-linux/releases/latest). Nothing to install — Wine is bundled.
+
+```bash
+chmod +x RadminVPN-Linux-x86_64.AppImage
+./RadminVPN-Linux-x86_64.AppImage
+```
+
+On first launch it will prompt for the Radmin VPN installer (download `Radmin_VPN_*.exe` from [radmin-vpn.com](https://www.radmin-vpn.com/) first). A terminal opens with progress, and one sudo password prompt is needed for TAP setup.
+
+Persistent state (wineprefix, MAC, logs) lives in `~/.local/share/radmin-vpn-linux/`.
+
+## Prerequisites (source build / non-AppImage)
 
 - **Wine** >= 11.0 (tested on Wine 11.5 Arch Linux and on Wine 11.6 Ubuntu 24.04)
 - **mingw-w64** cross-compilers (`i686-w64-mingw32-gcc`, `x86_64-w64-mingw32-gcc`) — for building from source
-- **python3** — for service log parsing
+- **iconv** (glibc) — for service log parsing
 - **sudo** access — for TAP device creation and routing
 - **TUN/TAP kernel support** — usually built-in, check with `modprobe tun`
 - **Radmin VPN installer** — download from [radmin-vpn.com](https://www.radmin-vpn.com/)
@@ -26,16 +39,16 @@ Linux app ← TAP (radminvpn0) ← tap_bridge ← FIFO ← rvpnnetmp.sys (Wine d
 ### Arch Linux
 
 ```bash
-sudo pacman -S wine mingw-w64-gcc python
+sudo pacman -S wine mingw-w64-gcc
 ```
 
 ### Ubuntu/Debian
 
 ```bash
-sudo apt install wine64 wine32 gcc-mingw-w64 python3
+sudo apt install wine64 wine32 gcc-mingw-w64
 ```
 
-## Quick start
+## Source quick start
 
 ```bash
 git clone https://github.com/baptisterajaut/radmin-vpn-linux.git
@@ -76,13 +89,22 @@ Produces:
 - `build/netsh.exe` — netsh replacement (32-bit PE)
 - `build/tap_bridge` — native Linux TAP bridge
 
+### Building the AppImage
+
+```bash
+make
+./packaging/build-appimage.sh       # → packaging/dist/RadminVPN-Linux-x86_64.AppImage
+```
+
+Downloads the Kron4ek Wine-Staging `amd64-wow64` build (~100 MB) and `appimagetool` on first run, caches both in `packaging/dist/`. Requires `curl` and ImageMagick (`convert`).
+
 ## What `run.sh` does
 
 1. **First run**: installs Radmin VPN via Wine (`/VERYSILENT`), removes the real NDIS driver (incompatible with Wine), registers our custom driver
 2. **Every run**: creates a TAP device, starts the TAP-to-FIFO bridge, configures Wine registry (adapter GUID, driver service), launches the Radmin VPN service and GUI
 3. **On exit** (Ctrl+C or close GUI): kills Wine, removes TAP device, cleans up
 
-The wineprefix is stored in `./wineprefix/`. A persistent MAC address is generated on first run and saved in the wineprefix.
+The wineprefix is stored in `./wineprefix/` (source run) or `~/.local/share/radmin-vpn-linux/wineprefix/` (AppImage). A persistent MAC address is generated on first run and saved in the wineprefix.
 
 ## Architecture
 

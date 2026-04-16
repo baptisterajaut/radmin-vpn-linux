@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Radmin VPN
+GenericName=VPN Client
+Comment=Radmin VPN (Windows) on Linux via Wine
+Exec=AppRun
+Icon=radmin-vpn
+Terminal=true
+Categories=Network;
+StartupWMClass=RvRvpnGui.exe

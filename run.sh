@@ -4,15 +4,35 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export WINEPREFIX="$DIR/wineprefix"
-RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
-BUILD_DIR="$DIR/build"
+export WINEDEBUG="-all"
+# Disable wine-mono + wine-gecko auto-install dialogs — Radmin VPN needs neither.
+export WINEDLLOVERRIDES="mscoree=;mshtml="
+# Suppress core dumps from expected transient crashes (Radmin's NDIS driver loading under wine).
+# Keeps systemd-coredump / DrKonqi / apport quiet.
+ulimit -c 0 2>/dev/null || true
+export WINEPREFIX="${WINEPREFIX:-$DIR/wineprefix}"
+RADMIN_DIR="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
+BUILD_DIR="${BUILD_DIR:-$DIR/build}"
 TAP_DEV="radminvpn0"
 CMD_FILE="/tmp/radmin_netsh_cmd"
 LOG="$WINEPREFIX/drive_c/ProgramData/Famatech/Radmin VPN/service.log"
 MAC_FILE="$WINEPREFIX/radmin_mac"
 RELAY_PID=""
 BRIDGE_PID=""
+
+# GUI fallback helpers: zenity → kdialog → xmessage → stdout/stdin
+gui_info() {
+    command -v zenity   >/dev/null 2>&1 && { zenity --info --title="$1" --no-wrap --text="$2" 2>/dev/null && return; }
+    command -v kdialog  >/dev/null 2>&1 && { kdialog --title "$1" --msgbox "$2" 2>/dev/null && return; }
+    command -v xmessage >/dev/null 2>&1 && { xmessage -center -buttons OK "$1: $2" 2>/dev/null && return; }
+    echo "[*] $2"
+}
+gui_pick_installer() {
+    command -v zenity  >/dev/null 2>&1 && { zenity --file-selection --title="Select Radmin VPN installer" --file-filter="Radmin VPN installer | Radmin_VPN_*.exe" 2>/dev/null && return; }
+    command -v kdialog >/dev/null 2>&1 && { kdialog --title "Select Radmin VPN installer" --getopenfilename "$HOME" "Radmin_VPN_*.exe" 2>/dev/null && return; }
+    echo "[?] Enter path to Radmin VPN installer (Radmin_VPN_*.exe):" >&2
+    read -r _p && printf '%s\n' "$_p"
+}
 
 # Parse args
 INSTALLER=""
@@ -23,9 +43,19 @@ for arg in "$@"; do
     esac
 done
 
-# Find installer if not specified
+# Find installer if not specified (search common locations)
 if [ -z "$INSTALLER" ]; then
-    INSTALLER=$(find "$DIR" -maxdepth 1 -name "Radmin_VPN_*.exe" -print -quit 2>/dev/null || true)
+    for p in "$DIR" "${RADMIN_DATA_DIR:-}" "$HOME/Downloads" "$PWD"; do
+        [ -n "$p" ] && [ -d "$p" ] || continue
+        INSTALLER=$(find "$p" -maxdepth 1 -name "Radmin_VPN_*.exe" -print -quit 2>/dev/null || true)
+        [ -n "$INSTALLER" ] && break
+    done
+fi
+# No installer found + Radmin not installed → prompt user
+if [ -z "$INSTALLER" ] && [ ! -f "$RADMIN_DIR/RvControlSvc.exe" ]; then
+    gui_info "Radmin VPN — installer needed" \
+        "Radmin VPN installer not found.\n\nDownload Radmin_VPN_*.exe from https://www.radmin-vpn.com/\nand select it in the next window."
+    INSTALLER=$(gui_pick_installer || true)
 fi
 
 cleanup() {
@@ -45,15 +75,18 @@ echo "[*] Radmin VPN for Linux"
 # Prerequisites
 command -v wine >/dev/null || { echo "[-] Wine not found. Install wine."; exit 1; }
 command -v wineserver >/dev/null || { echo "[-] wineserver not found."; exit 1; }
-command -v python3 >/dev/null || { echo "[-] python3 not found."; exit 1; }
-sudo -v || { echo "[-] Need sudo for TAP device."; exit 1; }
+command -v iconv >/dev/null || { echo "[-] iconv not found."; exit 1; }
+# Skip sudo validation if AppRun already primed it (avoids a second password prompt).
+if [ "${RADMIN_SUDO_PRIMED:-}" != "1" ]; then
+    sudo -v || { echo "[-] Need sudo for TAP device."; exit 1; }
+fi
 
 # 1. Kill any previous Wine session
 wineserver -k 2>/dev/null || true
 sleep 1
 
 # 2. Install Radmin if not present
-if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
+if [ ! -f "$RADMIN_DIR/RvControlSvc.exe" ]; then
     if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
         echo "[-] Radmin VPN not installed and no installer found."
         echo "    Download from https://www.radmin-vpn.com/ and run:"
@@ -62,28 +95,28 @@ if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
     fi
     echo "[*] Installing Radmin VPN..."
     mkdir -p "$WINEPREFIX"
-    WINEDEBUG=-all wineboot --init 2>/dev/null
+    wineboot --init 2>/dev/null
     echo "[+] Wine prefix created"
     wineserver -k 2>/dev/null || true
     sleep 2
     echo "[*] Running installer..."
-    WINEDEBUG=-all wine "$INSTALLER" /VERYSILENT /NORESTART 2>/dev/null || true
+    wine "$INSTALLER" /VERYSILENT /NORESTART 2>/dev/null || true
     echo "[*] Waiting for installer to finish..."
     for _ in $(seq 1 30); do
         sleep 2
-        [ -f "$RADMIN/RvControlSvc.exe" ] && break
+        [ -f "$RADMIN_DIR/RvControlSvc.exe" ] && break
     done
-    if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
+    if [ ! -f "$RADMIN_DIR/RvControlSvc.exe" ]; then
         echo "[-] Installer failed — RvControlSvc.exe not found"
         exit 1
     fi
     wineserver -k 2>/dev/null || true
     sleep 1
     # Remove real NDIS driver (crashes Wine — we replace it with rvpnnetmp.sys)
-    WINEDEBUG=-all wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
+    wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
     rm -f "$WINEPREFIX/drive_c/windows/system32/drivers/RvNetMP60.sys"
     # Disable SCM auto-start (we launch via rvpn_launcher /run)
-    WINEDEBUG=-all wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
+    wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
     wineserver -k 2>/dev/null || true
     sleep 1
     echo "[+] Radmin VPN installed"
@@ -93,8 +126,8 @@ fi
 echo "[*] Installing components..."
 chmod +x "$BUILD_DIR/tap_bridge" 2>/dev/null || true
 cp "$BUILD_DIR/rvpnnetmp.sys" "$WINEPREFIX/drive_c/windows/system32/drivers/"
-cp "$BUILD_DIR/adapter_hook.dll" "$RADMIN/"
-cp "$BUILD_DIR/rvpn_launcher.exe" "$RADMIN/"
+cp "$BUILD_DIR/adapter_hook.dll" "$RADMIN_DIR/"
+cp "$BUILD_DIR/rvpn_launcher.exe" "$RADMIN_DIR/"
 cp "$BUILD_DIR/netsh.exe" "$WINEPREFIX/drive_c/windows/syswow64/netsh.exe"
 
 # 4. Generate or load persistent adapter MAC
@@ -137,7 +170,7 @@ echo "[+] tap_bridge running (pid=$BRIDGE_PID)"
 
 # 7. Get TAP GUID from Wine and update registry
 echo "[*] Detecting TAP adapter GUID..."
-TAP_GUID=$(WINEDEBUG=-all wine wmic path Win32_NetworkAdapter get Name,GUID 2>/dev/null \
+TAP_GUID=$(wine wmic path Win32_NetworkAdapter get Name,GUID 2>/dev/null \
     | grep "$TAP_DEV" | awk '{print $1}' | tr -d '\r')
 if [ -z "$TAP_GUID" ]; then
     echo "[-] Could not read TAP GUID from Wine WMI"
@@ -188,29 +221,25 @@ rm -f "$LOG" "$WINEPREFIX/drive_c/radmin_driver.log"
 
 # 10. Start service
 echo "[*] Starting Radmin VPN service..."
-cd "$RADMIN"
-WINEDEBUG=-all wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
+cd "$RADMIN_DIR"
+wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 
 # 11. Wait for service ready + extract VPN IP
 echo "[*] Waiting for service ready..."
 for _ in $(seq 1 60); do
     sleep 1
     if [ -f "$LOG" ]; then
-        vpn_ip=$(python3 -c "
-with open('$LOG', 'rb') as f:
-    t = f.read().decode('utf-16-le', errors='replace')
-lines = t.strip().split('\n')
-has_ready = any('adapter ready' in l for l in lines)
-if has_ready:
-    for l in reversed(lines):
-        if 'Registered as' in l or ('IP:' in l and '0.0.0.0' not in l):
-            import re
-            m = re.search(r'26\.\d+\.\d+\.\d+', l)
-            if m: print(m.group()); break
-" 2>/dev/null)
-        if [ -n "$vpn_ip" ]; then
-            echo "[+] VPN IP: $vpn_ip"
-            break
+        log_txt=$(iconv -f UTF-16LE -t UTF-8 "$LOG" 2>/dev/null || true)
+        if printf '%s' "$log_txt" | grep -q 'adapter ready'; then
+            vpn_ip=$(printf '%s' "$log_txt" \
+                | grep -E 'Registered as|IP:' \
+                | grep -v '0\.0\.0\.0' \
+                | grep -oE '26\.[0-9]+\.[0-9]+\.[0-9]+' \
+                | tail -n1)
+            if [ -n "$vpn_ip" ]; then
+                echo "[+] VPN IP: $vpn_ip"
+                break
+            fi
         fi
     fi
     pgrep -f RvControlSvc >/dev/null || { echo "[-] Service died"; exit 1; }
@@ -226,7 +255,7 @@ echo ""
 
 # 13. Launch GUI
 echo "[*] Starting GUI..."
-WINEDEBUG=-all wine RvRvpnGui.exe > /tmp/radmin_gui.log 2>&1 &
+wine "$RADMIN_DIR/RvRvpnGui.exe" > /tmp/radmin_gui.log 2>&1 &
 GUI_PID=$!
 
 echo "[+] Radmin VPN running. Close the GUI or press Ctrl+C to stop."

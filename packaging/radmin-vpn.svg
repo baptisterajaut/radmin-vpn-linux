@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect width="256" height="256" rx="40" fill="#1a365d"/>
+  <circle cx="128" cy="128" r="88" fill="none" stroke="#ffffff" stroke-width="6" opacity="0.3"/>
+  <text x="128" y="128" text-anchor="middle" dominant-baseline="central"
+        font-family="DejaVu Sans, sans-serif" font-weight="bold" font-size="108" fill="#ffffff">R</text>
+  <text x="128" y="210" text-anchor="middle"
+        font-family="DejaVu Sans, sans-serif" font-weight="bold" font-size="24" fill="#ffffff">VPN</text>
+</svg>

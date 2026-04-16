@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 jobs:
   build:
@@ -10,22 +11,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64 imagemagick file
 
-      - name: Build
+      - name: Build binaries
         run: make
 
-      - name: Upload artifacts
+      - name: Build AppImage
+        run: ./packaging/build-appimage.sh
+
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: radmin-vpn-linux
+          name: radmin-vpn-linux-binaries
           path: |
             build/rvpnnetmp.sys
             build/adapter_hook.dll
             build/rvpn_launcher.exe
             build/netsh.exe
             build/tap_bridge
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: radmin-vpn-linux-appimage
+          path: packaging/dist/RadminVPN-Linux-x86_64.AppImage
 
   release:
     needs: build
@@ -36,14 +48,21 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: radmin-vpn-linux
+          name: radmin-vpn-linux-binaries
           path: build/
 
-      - name: Package
+      - uses: actions/download-artifact@v4
+        with:
+          name: radmin-vpn-linux-appimage
+          path: .
+
+      - name: Package tarball
         run: tar czf radmin-vpn-linux-${{ github.ref_name }}.tar.gz -C build .
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: radmin-vpn-linux-${{ github.ref_name }}.tar.gz
+          files: |
+            radmin-vpn-linux-${{ github.ref_name }}.tar.gz
+            RadminVPN-Linux-x86_64.AppImage
           generate_release_notes: true

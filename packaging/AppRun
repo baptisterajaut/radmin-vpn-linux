@@ -1,0 +1,90 @@
+#!/bin/bash
+# Radmin VPN Linux — AppImage bootstrap
+# Sets up bundled Wine + data dirs, primes sudo, then execs run.sh.
+set -euo pipefail
+
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+# ---- If not launched from a terminal, re-exec inside one so the user sees output ----
+if [ ! -t 1 ] && [ -z "${RADMIN_IN_TERM:-}" ]; then
+    export RADMIN_IN_TERM=1
+    SELF="$(readlink -f "$0")"
+    QUOTED_ARGS="$(printf '%q ' "$@")"
+    INNER="\"$SELF\" $QUOTED_ARGS; echo; echo '[Radmin VPN — press enter to close]'; read"
+    for term in konsole xfce4-terminal mate-terminal lxterminal alacritty kitty xterm; do
+        if command -v "$term" >/dev/null 2>&1; then
+            exec "$term" -e bash -c "$INNER"
+        fi
+    done
+    if command -v gnome-terminal >/dev/null 2>&1; then
+        exec gnome-terminal --wait -- bash -c "$INNER"
+    fi
+    # No terminal emulator found — fall through, output still goes to $DATA_DIR/run.log
+fi
+
+# ---- Data dir (persistent, outside the read-only AppImage) ----
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux"
+mkdir -p "$DATA_DIR"
+
+# ---- Bundled wine on PATH (Kron4ek tarball, plain binaries) ----
+export PATH="$APPDIR/wine/bin:$PATH"
+export WINELOADER="$APPDIR/wine/bin/wine"
+export WINESERVER="$APPDIR/wine/bin/wineserver"
+
+# ---- Env for run.sh ----
+export WINEPREFIX="$DATA_DIR/wineprefix"
+export BUILD_DIR="$APPDIR/usr/lib/radmin-vpn"
+export RADMIN_DATA_DIR="$DATA_DIR"
+
+# ---- Askpass: native binary, else synthesize via zenity/kdialog ----
+if [ -z "${SUDO_ASKPASS:-}" ] && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
+    for ap in /usr/bin/ksshaskpass /usr/bin/lxqt-openssh-askpass \
+              /usr/libexec/openssh/ssh-askpass /usr/lib/openssh/gnome-ssh-askpass3 \
+              /usr/lib/openssh/gnome-ssh-askpass /usr/lib/ssh/x11-ssh-askpass \
+              /usr/bin/ssh-askpass; do
+        [ -x "$ap" ] || continue
+        # ksshaskpass warns "Unable to parse phrase" on any non-SSH prompt — wrap to filter.
+        ASKPASS_SHIM="$(mktemp)"
+        printf '#!/bin/bash\nexec "%s" "$@" 2> >(grep -v "Unable to parse phrase" >&2)\n' "$ap" > "$ASKPASS_SHIM"
+        chmod +x "$ASKPASS_SHIM"
+        export SUDO_ASKPASS="$ASKPASS_SHIM"
+        break
+    done
+    if [ -z "${SUDO_ASKPASS:-}" ]; then
+        ASKPASS_SHIM="$(mktemp)"
+        if command -v zenity >/dev/null 2>&1; then
+            printf '#!/bin/sh\nzenity --password --title="Radmin VPN" --text="$1" 2>/dev/null\n' > "$ASKPASS_SHIM"
+        elif command -v kdialog >/dev/null 2>&1; then
+            printf '#!/bin/sh\nkdialog --title "Radmin VPN" --password "$1" 2>/dev/null\n' > "$ASKPASS_SHIM"
+        fi
+        [ -s "$ASKPASS_SHIM" ] && { chmod +x "$ASKPASS_SHIM"; export SUDO_ASKPASS="$ASKPASS_SHIM"; }
+    fi
+fi
+
+# ---- Prime sudo + background keep-alive ----
+SUDO_PROMPT="Radmin VPN needs root for TAP device and routes. Password:"
+if [ -n "${SUDO_ASKPASS:-}" ]; then
+    sudo -A -p "$SUDO_PROMPT" -v || { echo "[-] sudo required" >&2; exit 1; }
+else
+    echo "[*] $SUDO_PROMPT"
+    sudo -v || { echo "[-] sudo required" >&2; exit 1; }
+fi
+
+( while true; do sudo -nv 2>/dev/null || exit; sleep 50; done ) &
+KEEPALIVE_PID=$!
+
+export RADMIN_SUDO_PRIMED=1   # tells run.sh to skip its own sudo -v
+
+# ---- Logging: duplicate output to a persistent file so GUI launches are debuggable ----
+LOG_FILE="$DATA_DIR/run.log"
+: > "$LOG_FILE"
+
+cleanup() {
+    kill "$KEEPALIVE_PID" 2>/dev/null || true
+    rm -f "${ASKPASS_SHIM:-}"
+}
+trap cleanup EXIT
+
+# ---- Run ----
+bash "$APPDIR/usr/bin/run.sh" "$@" 2>&1 | tee -a "$LOG_FILE"
+# cleanup() fires via EXIT trap
