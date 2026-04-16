@@ -4,7 +4,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export WINEPREFIX="$HOME/.local/share/wineprefixes"
+export WINEPREFIX="$HOME/.local/share/wineprefixes/radmin_vpn"
 RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
 BUILD_DIR="$DIR/build"
 TAP_DEV="radminvpn0"
