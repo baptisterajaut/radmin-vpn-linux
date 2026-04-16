@@ -376,13 +376,16 @@ static void __stdcall rx_thread_proc(PVOID context)
                     dstMac[0] == 0xFF && dstMac[1] == 0xFF && dstMac[2] == 0xFF &&
                     dstMac[3] == 0xFF && dstMac[4] == 0xFF && dstMac[5] == 0xFF);
 
-                /* Find the right FILE_OBJECT for unicast */
+                /* Find the right FILE_OBJECT for unicast.
+                 * Slots with fo == NULL were released by DispatchClose and
+                 * will be reused by the next PEERMAC; skip them here. */
                 PFILE_OBJECT target_fo = NULL;
                 if (!is_bcast && frameLen >= 6) {
                     LONG rc = g_peer_route_count;
                     if (rc > MAX_PEER_ROUTES) rc = MAX_PEER_ROUTES;
                     for (LONG r = 0; r < rc; r++) {
-                        if (RtlCompareMemory(g_peer_routes[r].mac, dstMac, 6) == 6) {
+                        if (g_peer_routes[r].fo != NULL &&
+                            RtlCompareMemory(g_peer_routes[r].mac, dstMac, 6) == 6) {
                             target_fo = g_peer_routes[r].fo;
                             break;
                         }
@@ -390,10 +393,18 @@ static void __stdcall rx_thread_proc(PVOID context)
                 }
 
                 if (is_bcast) {
-                    /* Broadcast: deliver to one IRP per unique FILE_OBJECT */
-                    PIRP batch[64];
+                    /* Broadcast: deliver to one IRP per unique FILE_OBJECT.
+                     * Sized to IRP_QUEUE_SIZE so the fanout can't silently
+                     * truncate — with N peers each holding a pending read,
+                     * the queue itself caps the number of distinct FOs.
+                     * Static because only one RX thread ever enters this
+                     * branch, and only while holding g_irp_queue.Lock —
+                     * so no concurrent reuse, and we keep the kernel
+                     * stack small (mingw inserts ___chkstk_ms for >4KB
+                     * frames, which the kernel link doesn't resolve). */
+                    static PIRP batch[IRP_QUEUE_SIZE];
+                    static PFILE_OBJECT seen[IRP_QUEUE_SIZE];
                     LONG batch_n = 0;
-                    PFILE_OBJECT seen[64];
                     LONG seen_n = 0;
                     LONG remaining = 0;
 
@@ -404,7 +415,7 @@ static void __stdcall rx_thread_proc(PVOID context)
                         for (LONG s = 0; s < seen_n; s++) {
                             if (seen[s] == fo) { already = 1; break; }
                         }
-                        if (!already && seen_n < 64) {
+                        if (!already && seen_n < IRP_QUEUE_SIZE) {
                             seen[seen_n++] = fo;
                             batch[batch_n++] = g_irp_queue.Irps[idx];
                             /* Mark slot as consumed by shifting */
@@ -576,6 +587,39 @@ static NTSTATUS NTAPI DispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 static NTSTATUS NTAPI DispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     (void)DeviceObject;
+
+    /* Release peer-route slots owned by the closing FILE_OBJECT.
+     * Without this the table monotonically grew and would saturate even
+     * with a modest peer count if clients reconnected. */
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+    PFILE_OBJECT fo = sp->FileObject;
+    if (fo) {
+        KIRQL oldIrql;
+        LONG freed = 0;
+        KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+        for (LONG i = 0; i < g_peer_route_count; i++) {
+            if (g_peer_routes[i].fo == fo) {
+                g_peer_routes[i].fo = NULL;
+                RtlZeroMemory(g_peer_routes[i].mac, 6);
+                freed++;
+            }
+        }
+        while (g_peer_route_count > 0 &&
+               g_peer_routes[g_peer_route_count - 1].fo == NULL)
+            g_peer_route_count--;
+        LONG wm = g_peer_route_count;
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+        if (freed > 0) {
+            char buf[48] = "CLOSE freed=";
+            hex32(buf + 12, (ULONG)freed);
+            buf[20] = ' '; buf[21] = 'w'; buf[22] = 'm'; buf[23] = '=';
+            hex32(buf + 24, (ULONG)wm);
+            buf[32] = 0;
+            drv_log(buf);
+        }
+    }
+
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -656,11 +700,24 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
         if (inLen >= 6 && sysBuffer) {
             PIO_STACK_LOCATION sp2 = IoGetCurrentIrpStackLocation(Irp);
             PFILE_OBJECT fo = sp2->FileObject;
-            LONG idx = InterlockedIncrement(&g_peer_route_count) - 1;
-            if (idx < MAX_PEER_ROUTES) {
-                g_peer_routes[idx].fo = fo;
-                RtlCopyMemory(g_peer_routes[idx].mac, sysBuffer, 6);
+            KIRQL oldIrql;
+            LONG assigned = -1;
+
+            /* Share g_irp_queue.Lock with the RX thread: lookups there
+             * already hold it, and slot reuse on DispatchClose needs it
+             * too. One lock means no inversion. */
+            KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+            for (LONG i = 0; i < g_peer_route_count; i++) {
+                if (g_peer_routes[i].fo == NULL) { assigned = i; break; }
             }
+            if (assigned < 0 && g_peer_route_count < MAX_PEER_ROUTES)
+                assigned = g_peer_route_count++;
+            if (assigned >= 0) {
+                g_peer_routes[assigned].fo = fo;
+                RtlCopyMemory(g_peer_routes[assigned].mac, sysBuffer, 6);
+            }
+            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
             char buf[64] = "PEERMAC fo=";
             hex32(buf + 11, (ULONG)(ULONG_PTR)fo);
             buf[19] = ' ';
@@ -671,6 +728,8 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
                 buf[22 + k*3] = (k < 5) ? ':' : '\0';
             }
             drv_log(buf);
+            if (assigned < 0)
+                drv_log("PEERMAC table full");
         }
         break;
 
