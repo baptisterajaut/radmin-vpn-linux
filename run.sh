@@ -4,15 +4,18 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export WINEPREFIX="$DIR/wineprefix"
-RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
-BUILD_DIR="$DIR/build"
-TAP_DEV="radminvpn0"
-CMD_FILE="/tmp/radmin_netsh_cmd"
-LOG="$WINEPREFIX/drive_c/ProgramData/Famatech/Radmin VPN/service.log"
-MAC_FILE="$WINEPREFIX/radmin_mac"
-RELAY_PID=""
-BRIDGE_PID=""
+
+export WINEDEBUG="-all"
+export WINEPREFIX="$HOME/.local/share/wineprefixes/radmin_vpn"
+
+export RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
+export BUILD_DIR="$DIR/build"
+export TAP_DEV="radminvpn0"
+export CMD_FILE="/tmp/radmin_netsh_cmd"
+export LOG="$WINEPREFIX/drive_c/ProgramData/Famatech/Radmin VPN/service.log"
+export MAC_FILE="$WINEPREFIX/radmin_mac"
+export RELAY_PID=""
+export BRIDGE_PID=""
 
 # Parse args
 INSTALLER=""
@@ -62,12 +65,12 @@ if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
     fi
     echo "[*] Installing Radmin VPN..."
     mkdir -p "$WINEPREFIX"
-    WINEDEBUG=-all wineboot --init 2>/dev/null
+    wineboot --init 2>/dev/null
     echo "[+] Wine prefix created"
     wineserver -k 2>/dev/null || true
     sleep 2
     echo "[*] Running installer..."
-    WINEDEBUG=-all wine "$INSTALLER" /VERYSILENT /NORESTART 2>/dev/null || true
+    wine "$INSTALLER" /VERYSILENT /NORESTART 2>/dev/null || true
     echo "[*] Waiting for installer to finish..."
     for _ in $(seq 1 30); do
         sleep 2
@@ -80,10 +83,10 @@ if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
     wineserver -k 2>/dev/null || true
     sleep 1
     # Remove real NDIS driver (crashes Wine — we replace it with rvpnnetmp.sys)
-    WINEDEBUG=-all wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
+    wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
     rm -f "$WINEPREFIX/drive_c/windows/system32/drivers/RvNetMP60.sys"
     # Disable SCM auto-start (we launch via rvpn_launcher /run)
-    WINEDEBUG=-all wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
+    wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
     wineserver -k 2>/dev/null || true
     sleep 1
     echo "[+] Radmin VPN installed"
@@ -137,7 +140,7 @@ echo "[+] tap_bridge running (pid=$BRIDGE_PID)"
 
 # 7. Get TAP GUID from Wine and update registry
 echo "[*] Detecting TAP adapter GUID..."
-TAP_GUID=$(WINEDEBUG=-all wine wmic path Win32_NetworkAdapter get Name,GUID 2>/dev/null \
+TAP_GUID=$(wine wmic path Win32_NetworkAdapter get Name,GUID 2>/dev/null \
     | grep "$TAP_DEV" | awk '{print $1}' | tr -d '\r')
 if [ -z "$TAP_GUID" ]; then
     echo "[-] Could not read TAP GUID from Wine WMI"
@@ -189,7 +192,7 @@ rm -f "$LOG" "$WINEPREFIX/drive_c/radmin_driver.log"
 # 10. Start service
 echo "[*] Starting Radmin VPN service..."
 cd "$RADMIN"
-WINEDEBUG=-all wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
+wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 
 # 11. Wait for service ready + extract VPN IP
 echo "[*] Waiting for service ready..."
@@ -226,7 +229,7 @@ echo ""
 
 # 13. Launch GUI
 echo "[*] Starting GUI..."
-WINEDEBUG=-all wine RvRvpnGui.exe > /tmp/radmin_gui.log 2>&1 &
+wine RvRvpnGui.exe > /tmp/radmin_gui.log 2>&1 &
 GUI_PID=$!
 
 echo "[+] Radmin VPN running. Close the GUI or press Ctrl+C to stop."
