@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=tap_bridge
+GenericName=Radmin
+Comment=Radmin VPN
+StartupWMClass=tap_bridge
+Exec=tap_bridge %f
+Terminal=true
+NoDisplay=true
+Type=Application
+Categories=Network;
