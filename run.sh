@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/env bash
 # run.sh - Radmin VPN on Linux
 # Usage: ./run.sh [--installer /path/to/Radmin_VPN_*.exe]
 set -euo pipefail
