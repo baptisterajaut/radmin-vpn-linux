@@ -134,7 +134,7 @@ echo "[*] Starting tap_bridge..."
 pkill -f tap_bridge 2>/dev/null || true
 sleep 0.3
 rm -f /tmp/rvpn_b2d /tmp/rvpn_d2b
-"$BUILD_DIR/tap_bridge" > /tmp/radmin_bridge.log 2>&1 &
+pkexec "$BUILD_DIR/tap_bridge" > /tmp/radmin_bridge.log 2>&1 &
 BRIDGE_PID=$!
 for _ in $(seq 1 10); do
     [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b ] && break
