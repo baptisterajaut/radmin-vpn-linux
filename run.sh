@@ -6,10 +6,10 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export WINEDEBUG="-all"
 # Disable wine-mono + wine-gecko auto-install dialogs — Radmin VPN needs neither.
-# Force native netsh.exe: wine-staging 11.x loads its builtin netsh stub even when a
-# native PE sits in system32/syswow64, so our wrapper is skipped. "n" (native only)
-# is the one-flag fix that restored IP assignment after the AppImage bundled wine-staging.
-export WINEDLLOVERRIDES="mscoree=;mshtml=;netsh.exe=n"
+# netsh.exe override is set LATER (just before service start) — setting it here breaks
+# the Inno Setup firewall CA on fresh prefixes (our netsh wrapper isn't copied yet,
+# "n" blocks the builtin fallback, CreateProcess fails with c0000135 → install rolls back).
+export WINEDLLOVERRIDES="mscoree=;mshtml="
 # Suppress core dumps from expected transient crashes (Radmin's NDIS driver loading under wine).
 # Keeps systemd-coredump / DrKonqi / apport quiet.
 ulimit -c 0 2>/dev/null || true
@@ -223,6 +223,11 @@ RELAY_PID=$!
 rm -f "$LOG" "$WINEPREFIX/drive_c/radmin_driver.log"
 
 # 10. Start service
+# Force native netsh.exe: wine-staging 11.x prefers its builtin stub even when a native
+# PE sits in syswow64, so our wrapper would be skipped. "n" (native only) is the one-flag
+# fix that restored IP assignment. Deferred to here so the install-phase firewall CA
+# can use Wine's builtin stub (our wrapper doesn't exist until step 3 runs).
+export WINEDLLOVERRIDES="mscoree=;mshtml=;netsh.exe=n"
 echo "[*] Starting Radmin VPN service..."
 cd "$RADMIN_DIR"
 wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
