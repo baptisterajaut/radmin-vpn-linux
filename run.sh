@@ -37,6 +37,140 @@ gui_pick_installer() {
     read -r _p && printf '%s\n' "$_p"
 }
 
+dump_log() {
+    local name="$1" path="$2" transform="${3:-}"
+    echo "--- $name ($path) ---"
+    if [ ! -e "$path" ]; then
+        echo "  (file not found)"
+    elif [ ! -s "$path" ]; then
+        echo "  (empty)"
+    elif [ "$transform" = "utf16" ]; then
+        iconv -f UTF-16LE -t UTF-8 "$path" 2>/dev/null | tail -n 40 | sed 's/^/  /'
+    else
+        tail -n 40 "$path" | sed 's/^/  /'
+    fi
+    echo ""
+}
+
+# Wine version utils. AppImage (bundled) sets $APPIMAGE; system Wine does not.
+wine_version_str() { wine --version 2>/dev/null | head -n1; }
+wine_major() { wine_version_str | sed -n 's/^wine-\([0-9]\+\).*/\1/p'; }
+
+DIAG_FAILS=0
+diag_ok()   { echo "  [ok]   $1"; }
+diag_miss() { echo "  [MISS] $1"; DIAG_FAILS=$((DIAG_FAILS+1)); }
+diag_bad()  { echo "  [BAD]  $1"; DIAG_FAILS=$((DIAG_FAILS+1)); }
+
+dump_diagnostics() {
+    DIAG_FAILS=0
+    echo ""
+    echo "===================== DIAGNOSTICS ====================="
+    echo "[-] $1"
+    echo ""
+
+    echo "--- Environment ---"
+    local wv wmaj src
+    wv=$(wine_version_str || echo '?')
+    wmaj=$(wine_major || echo 0)
+    if [ -n "${APPIMAGE:-}" ]; then
+        src="bundled (AppImage)"
+    else
+        src="system ($(command -v wine 2>/dev/null || echo '?'))"
+    fi
+    echo "  [info] Wine: $wv — $src"
+    if [ "${wmaj:-0}" -lt 11 ] 2>/dev/null; then
+        diag_bad "Wine $wv is older than 11.0 — known to break the driver (overlapped I/O changes)"
+    fi
+    echo "  [info] WINEPREFIX: $WINEPREFIX"
+    echo "  [info] Kernel: $(uname -srm)"
+    echo ""
+
+    echo "--- Processes ---"
+    for name in RvControlSvc.exe rvpn_launcher.exe services.exe wineserver tap_bridge; do
+        local pids
+        pids=$(pgrep -af "$name" 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            echo "  [alive] $name"
+            printf '%s\n' "$pids" | sed 's/^/          /'
+        else
+            echo "  [dead]  $name"
+        fi
+    done
+    echo ""
+
+    echo "--- Sanity checks ---"
+    [ -f "$WINEPREFIX/drive_c/windows/system32/drivers/rvpnnetmp.sys" ] \
+        && diag_ok "driver rvpnnetmp.sys installed" \
+        || diag_miss "driver rvpnnetmp.sys missing"
+    [ -f "$RADMIN_DIR/RvControlSvc.exe" ] \
+        && diag_ok "RvControlSvc.exe present" \
+        || diag_miss "RvControlSvc.exe missing"
+    [ -f "$RADMIN_DIR/adapter_hook.dll" ] \
+        && diag_ok "adapter_hook.dll present" \
+        || diag_miss "adapter_hook.dll missing"
+    [ -f "$RADMIN_DIR/rvpn_launcher.exe" ] \
+        && diag_ok "rvpn_launcher.exe present" \
+        || diag_miss "rvpn_launcher.exe missing"
+    [ -f "$WINEPREFIX/drive_c/windows/syswow64/netsh.exe" ] \
+        && diag_ok "netsh.exe wrapper installed" \
+        || diag_miss "netsh.exe wrapper missing"
+    if [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b ]; then
+        diag_ok "FIFOs /tmp/rvpn_{b2d,d2b}"
+    else
+        diag_miss "FIFOs /tmp/rvpn_{b2d,d2b}"
+    fi
+    if [ -f /tmp/rvpn_mac ] && [ "$(stat -c%s /tmp/rvpn_mac 2>/dev/null)" = "6" ]; then
+        diag_ok "/tmp/rvpn_mac (6 bytes)"
+    else
+        diag_bad "/tmp/rvpn_mac missing or wrong size"
+    fi
+    if ip link show "$TAP_DEV" >/dev/null 2>&1; then
+        diag_ok "TAP $TAP_DEV up ($(ip -br link show "$TAP_DEV" | awk '{print $2,$3}'))"
+    else
+        diag_miss "TAP $TAP_DEV not found"
+    fi
+    local rvpn_start
+    rvpn_start=$(wine reg query "HKLM\\SYSTEM\\CurrentControlSet\\Services\\rvpnnetmp" /v Start 2>/dev/null \
+        | grep -oE '0x[0-9a-f]+' | head -n1)
+    [ -n "$rvpn_start" ] \
+        && diag_ok "registry rvpnnetmp (Start=$rvpn_start)" \
+        || diag_miss "registry rvpnnetmp not found"
+    echo ""
+
+    dump_log "launcher stdout/stderr" /tmp/radmin_service.log
+    dump_log "driver log"             "$WINEPREFIX/drive_c/radmin_driver.log"
+    dump_log "service log (Famatech)" "$LOG" utf16
+    dump_log "tap_bridge log"         /tmp/radmin_bridge.log
+
+    echo "--- Summary ---"
+    if [ "$DIAG_FAILS" -eq 0 ]; then
+        echo "  All sanity checks passed."
+    else
+        echo "  $DIAG_FAILS check(s) failed — see [MISS]/[BAD] above."
+    fi
+    echo "======================================================="
+    echo ""
+    echo "Please attach the block above when reporting a bug:"
+    echo "  https://github.com/baptisterajaut/radmin-vpn-linux/issues"
+    echo ""
+}
+
+# Retry the service once with Wine err-channel logging enabled. Called only when
+# dump_diagnostics found nothing wrong — gives us a hope of catching the crash
+# cause when the launcher log is empty (service dies before writing anything).
+retry_verbose() {
+    echo "[*] All sanity checks passed — retrying with WINEDEBUG=err+all to capture the crash..."
+    echo ""
+    wineserver -k 2>/dev/null || true
+    sleep 1
+    ( cd "$RADMIN_DIR" && \
+        WINEDEBUG="err+all,fixme-all" timeout 15 wine rvpn_launcher.exe /run \
+        > /tmp/radmin_service_verbose.log 2>&1 ) || true
+    wineserver -k 2>/dev/null || true
+    sleep 1
+    dump_log "verbose launcher output (WINEDEBUG=err+all)" /tmp/radmin_service_verbose.log
+}
+
 # Parse args
 INSTALLER=""
 for arg in "$@"; do
@@ -79,6 +213,19 @@ echo "[*] Radmin VPN for Linux"
 command -v wine >/dev/null || { echo "[-] Wine not found. Install wine."; exit 1; }
 command -v wineserver >/dev/null || { echo "[-] wineserver not found."; exit 1; }
 command -v iconv >/dev/null || { echo "[-] iconv not found."; exit 1; }
+# Wine version gate: we require >= 11.0 for overlapped I/O semantics. Bundled Wine
+# in the AppImage is 11.6, so this only trips on system Wine installs.
+WINE_VERSION_STR=$(wine_version_str || echo '?')
+WINE_MAJOR=$(wine_major || echo 0)
+if [ -n "${APPIMAGE:-}" ]; then
+    echo "[*] Using bundled Wine ($WINE_VERSION_STR)"
+elif ! [ "${WINE_MAJOR:-0}" -ge 11 ] 2>/dev/null; then
+    echo "[-] Wine $WINE_VERSION_STR is too old — Radmin VPN requires Wine >= 11.0."
+    echo "    Upgrade wine-staging on your distro, or use the AppImage release"
+    echo "    (https://github.com/baptisterajaut/radmin-vpn-linux/releases) which"
+    echo "    bundles Wine 11.6."
+    exit 1
+fi
 # Skip sudo validation if AppRun already primed it (avoids a second password prompt).
 if [ "${RADMIN_SUDO_PRIMED:-}" != "1" ]; then
     sudo -v || { echo "[-] Need sudo for TAP device."; exit 1; }
@@ -234,6 +381,8 @@ wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 
 # 11. Wait for service ready + extract VPN IP
 echo "[*] Waiting for service ready..."
+SERVICE_START=$(date +%s)
+SERVICE_SEEN=0
 for _ in $(seq 1 60); do
     sleep 1
     if [ -f "$LOG" ]; then
@@ -250,7 +399,20 @@ for _ in $(seq 1 60); do
             fi
         fi
     fi
-    pgrep -f RvControlSvc >/dev/null || { echo "[-] Service died"; exit 1; }
+    if pgrep -f RvControlSvc >/dev/null; then
+        SERVICE_SEEN=1
+    else
+        elapsed=$(( $(date +%s) - SERVICE_START ))
+        if [ "$SERVICE_SEEN" = "1" ]; then
+            dump_diagnostics "Service started then died after ${elapsed}s"
+            [ "$DIAG_FAILS" -eq 0 ] && retry_verbose
+            exit 1
+        elif [ "$elapsed" -ge 5 ]; then
+            dump_diagnostics "Service never started (waited ${elapsed}s — launcher or injection failed)"
+            [ "$DIAG_FAILS" -eq 0 ] && retry_verbose
+            exit 1
+        fi
+    fi
 done
 
 # 12. Set up on-link route
