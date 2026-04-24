@@ -53,10 +53,11 @@ static ULONG WINAPI hook_GetAdaptersAddresses(
         if (!cur->Description || wcscmp(cur->Description, TAP_DESC) != 0)
             continue;
 
-        WCHAR *newDesc = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, 128);
-        WCHAR *newFN   = (WCHAR *)HeapAlloc(GetProcessHeap(), 0, 64);
-        if (newDesc) { wcscpy(newDesc, RADMIN_DESC);     cur->Description  = newDesc; }
-        if (newFN)   { wcscpy(newFN, RADMIN_FRIENDLY);   cur->FriendlyName = newFN; }
+        /* Point at read-only string literals: caller frees the whole adapter
+         * info buffer in one shot and never touches these fields individually,
+         * so we avoid a per-call HeapAlloc that was never freed. */
+        cur->Description  = (WCHAR *)RADMIN_DESC;
+        cur->FriendlyName = (WCHAR *)RADMIN_FRIENDLY;
 
         dbg("hook: renamed radminvpn0 -> Famatech Radmin VPN Ethernet Adapter");
     }

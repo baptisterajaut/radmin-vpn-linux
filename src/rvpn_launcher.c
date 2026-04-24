@@ -62,6 +62,11 @@ int main(int argc, char *argv[])
             WaitForSingleObject(remote_thread, 5000);
             CloseHandle(remote_thread);
         }
+
+        /* Reclaim the path buffer in the target — LoadLibraryA has copied
+         * the string into its own state by now, and this allocation would
+         * otherwise live for the whole lifetime of the service. */
+        VirtualFreeEx(pi.hProcess, remote_str, 0, MEM_RELEASE);
     }
 skip_inject:
 

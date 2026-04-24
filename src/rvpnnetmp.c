@@ -155,7 +155,10 @@ static volatile LONG g_icmp_tx = 0;   /* service → TAP (inbound ICMP) */
 
 /* ============ RX ring buffer + pending IRP ============ */
 
-#define RX_RING_SIZE 64
+/* RX_RING is a fallback used only when no overlapped ReadFile IRP is pending.
+ * In steady state with a running service every frame is delivered via IRP, so
+ * the ring is almost always empty — 16 slots (~26 KB) is more than enough. */
+#define RX_RING_SIZE 16
 #define RX_FRAME_MAX 1600
 
 typedef struct _RX_RING {
@@ -189,12 +192,25 @@ static struct {
 
 /* Per-handle peer MAC routing table.
  * IOCTL_RVPN_PEERMAC associates a MAC with the calling FILE_OBJECT.
- * The RX thread uses this to route frames to the right handle. */
-#define MAX_PEER_ROUTES 1024
-static struct {
+ * The RX thread uses this to route frames to the right handle.
+ *
+ * Dynamically grown: starts at PEER_ROUTES_INITIAL, doubles up to
+ * PEER_ROUTES_MAX when saturated. Keeps the baseline kernel footprint
+ * small instead of reserving a worst-case 1024-slot table for every
+ * session. Allocated via NonPagedPool so RX-thread lookups stay legal
+ * at DISPATCH_LEVEL; growth is done outside the spinlock and committed
+ * by an atomic pointer swap. */
+#define PEER_ROUTES_INITIAL 16
+#define PEER_ROUTES_MAX     4096
+#define PEER_ROUTES_TAG     'rPvR'  /* "RvPr" backwards: pool tags are printed LE */
+
+typedef struct _PEER_ROUTE {
     PFILE_OBJECT fo;
     UCHAR mac[6];
-} g_peer_routes[MAX_PEER_ROUTES];
+} PEER_ROUTE;
+
+static PEER_ROUTE *g_peer_routes = NULL;
+static LONG        g_peer_routes_capacity = 0;  /* protected by g_irp_queue.Lock */
 static volatile LONG g_peer_route_count = 0;
 
 /* Diagnostic counters */
@@ -380,9 +396,9 @@ static void __stdcall rx_thread_proc(PVOID context)
                  * Slots with fo == NULL were released by DispatchClose and
                  * will be reused by the next PEERMAC; skip them here. */
                 PFILE_OBJECT target_fo = NULL;
-                if (!is_bcast && frameLen >= 6) {
+                if (!is_bcast && frameLen >= 6 && g_peer_routes) {
                     LONG rc = g_peer_route_count;
-                    if (rc > MAX_PEER_ROUTES) rc = MAX_PEER_ROUTES;
+                    if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
                     for (LONG r = 0; r < rc; r++) {
                         if (g_peer_routes[r].fo != NULL &&
                             RtlCompareMemory(g_peer_routes[r].mac, dstMac, 6) == 6) {
@@ -702,21 +718,70 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
             PFILE_OBJECT fo = sp2->FileObject;
             KIRQL oldIrql;
             LONG assigned = -1;
+            LONG grew_to = 0;
 
             /* Share g_irp_queue.Lock with the RX thread: lookups there
              * already hold it, and slot reuse on DispatchClose needs it
-             * too. One lock means no inversion. */
-            KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
-            for (LONG i = 0; i < g_peer_route_count; i++) {
-                if (g_peer_routes[i].fo == NULL) { assigned = i; break; }
+             * too. One lock means no inversion.
+             *
+             * Growth path: if the table is full, sample the capacity under
+             * lock, drop the lock to ExAllocatePool (forbidden at
+             * DISPATCH_LEVEL under certain pool types and generally unwise
+             * while holding a spinlock), then reacquire to install. If
+             * another PEERMAC beat us to the growth we drop our buffer and
+             * retry — the winner already made room. */
+            for (;;) {
+                KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+                for (LONG i = 0; i < g_peer_route_count; i++) {
+                    if (g_peer_routes[i].fo == NULL) { assigned = i; break; }
+                }
+                if (assigned < 0 && g_peer_route_count < g_peer_routes_capacity)
+                    assigned = g_peer_route_count++;
+
+                if (assigned >= 0) {
+                    g_peer_routes[assigned].fo = fo;
+                    RtlCopyMemory(g_peer_routes[assigned].mac, sysBuffer, 6);
+                    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+                    break;
+                }
+
+                /* Table saturated — attempt growth. */
+                LONG old_cap = g_peer_routes_capacity;
+                KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+                if (old_cap >= PEER_ROUTES_MAX) {
+                    drv_log("PEERMAC table full (max capacity)");
+                    break;
+                }
+
+                LONG new_cap = old_cap * 2;
+                if (new_cap > PEER_ROUTES_MAX) new_cap = PEER_ROUTES_MAX;
+
+                PEER_ROUTE *new_buf = (PEER_ROUTE *)ExAllocatePoolWithTag(
+                    NonPagedPool, sizeof(PEER_ROUTE) * new_cap, PEER_ROUTES_TAG);
+                if (!new_buf) {
+                    drv_log("PEERMAC grow: alloc failed");
+                    break;
+                }
+                RtlZeroMemory(new_buf, sizeof(PEER_ROUTE) * new_cap);
+
+                PEER_ROUTE *old_buf = NULL;
+                KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+                if (g_peer_routes_capacity == old_cap) {
+                    RtlCopyMemory(new_buf, g_peer_routes,
+                                  sizeof(PEER_ROUTE) * g_peer_routes_capacity);
+                    old_buf = g_peer_routes;
+                    g_peer_routes = new_buf;
+                    g_peer_routes_capacity = new_cap;
+                    grew_to = new_cap;
+                } else {
+                    /* Someone else grew first — throw ours away and retry */
+                    old_buf = new_buf;
+                }
+                KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+                ExFreePoolWithTag(old_buf, PEER_ROUTES_TAG);
+                /* Retry the assignment with the (possibly new) capacity */
             }
-            if (assigned < 0 && g_peer_route_count < MAX_PEER_ROUTES)
-                assigned = g_peer_route_count++;
-            if (assigned >= 0) {
-                g_peer_routes[assigned].fo = fo;
-                RtlCopyMemory(g_peer_routes[assigned].mac, sysBuffer, 6);
-            }
-            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
             char buf[64] = "PEERMAC fo=";
             hex32(buf + 11, (ULONG)(ULONG_PTR)fo);
@@ -728,8 +793,12 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
                 buf[22 + k*3] = (k < 5) ? ':' : '\0';
             }
             drv_log(buf);
-            if (assigned < 0)
-                drv_log("PEERMAC table full");
+            if (grew_to) {
+                char gb[48] = "PEERMAC grew cap=";
+                hex32(gb + 17, (ULONG)grew_to);
+                gb[25] = 0;
+                drv_log(gb);
+            }
         }
         break;
 
@@ -991,6 +1060,12 @@ static VOID NTAPI Unload(PDRIVER_OBJECT DriverObject)
         if (ext->FifoD2B) ZwClose(ext->FifoD2B);
         IoDeleteDevice(DriverObject->DeviceObject);
     }
+
+    if (g_peer_routes) {
+        ExFreePoolWithTag(g_peer_routes, PEER_ROUTES_TAG);
+        g_peer_routes = NULL;
+        g_peer_routes_capacity = 0;
+    }
 }
 
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -1022,6 +1097,18 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Registry
     RtlZeroMemory(deviceObject->DeviceExtension, sizeof(DEVICE_EXTENSION));
     g_DeviceObject = deviceObject;
     KeInitializeSpinLock(&g_irp_queue.Lock);
+
+    /* Allocate the initial peer-routes table. Kept small — the table
+     * grows on demand via PEERMAC when real peer counts require it. */
+    g_peer_routes = (PEER_ROUTE *)ExAllocatePoolWithTag(
+        NonPagedPool, sizeof(PEER_ROUTE) * PEER_ROUTES_INITIAL, PEER_ROUTES_TAG);
+    if (!g_peer_routes) {
+        IoDeleteSymbolicLink(&dosDeviceName);
+        IoDeleteDevice(deviceObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(g_peer_routes, sizeof(PEER_ROUTE) * PEER_ROUTES_INITIAL);
+    g_peer_routes_capacity = PEER_ROUTES_INITIAL;
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = DispatchCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = DispatchClose;
