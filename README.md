@@ -126,10 +126,26 @@ The wineprefix is stored in `./wineprefix/` (source run) or `~/.local/share/radm
 
 **First ping is slow (~1s)**: normal — it's ARP resolution through the VPN tunnel. Subsequent pings are 40-80ms depending on peer distance.
 
+**LAN games don't see other peers / "auto-discovery" broken**: most LAN games discover each other with broadcast probes (UDP to `255.255.255.255`) or multicast (`224.0.0.0/4`). On Windows the Radmin TAP driver advertises itself as the preferred interface for those flows; on Linux you have to tell the kernel explicitly. `run.sh` now installs two extra routes when the VPN comes up:
+
+```
+ip route append 255.255.255.255/32 dev radminvpn0 metric 0
+ip route append 224.0.0.0/4        dev radminvpn0 metric 0
+```
+
+Side effect: mDNS / Bonjour / SSDP on your physical LAN (Chromecast, AirPrint, Sonos, smart TVs, ...) will go through the VPN while it's up. If you need local-LAN discovery and Radmin in parallel, run with `--no-broadcast-routes`:
+
+```bash
+./run.sh --no-broadcast-routes
+```
+
+The routes are scoped to the TAP device, so they're auto-removed when `run.sh` tears the device down on exit.
+
 ## Known limitations
 
 - Only one instance can run at a time (shared FIFOs in `/tmp/`)
 - The `26.0.0.0/8` on-link route affects the entire system while running (cleaned up on exit)
+- Default broadcast (`255.255.255.255/32`) and multicast (`224.0.0.0/4`) routes are steered to the VPN — disable with `--no-broadcast-routes` if you need local-LAN mDNS / SSDP in parallel
 - Older Wine versions (< 11.0) may have different overlapped I/O behavior that breaks the driver
 
 ## Notes

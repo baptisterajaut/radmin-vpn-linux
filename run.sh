@@ -173,10 +173,12 @@ retry_verbose() {
 
 # Parse args
 INSTALLER=""
+NO_BCAST_ROUTES=0
 for arg in "$@"; do
     case "$arg" in
         --installer) shift; INSTALLER="$1"; shift ;;
         --installer=*) INSTALLER="${arg#*=}" ;;
+        --no-broadcast-routes) NO_BCAST_ROUTES=1 ;;
     esac
 done
 
@@ -415,10 +417,27 @@ for _ in $(seq 1 60); do
     fi
 done
 
-# 12. Set up on-link route
+# 12. Set up on-link route + broadcast/multicast steering
+# The driver now fans out group-addressed frames (broadcast + IPv4/IPv6
+# multicast) to every connected peer, but the Linux kernel still has to
+# pick our TAP as the egress for those frames. Without these two routes
+# the kernel sends them on the default interface (or nowhere) and games
+# that rely on LAN auto-discovery (broadcast probes, mDNS, SSDP, ...)
+# never see other Radmin peers.
+#
+# Side effect: while the VPN is up, mDNS / Bonjour / SSDP on the local
+# physical LAN go via Radmin instead of eth0/wlan0. Pass
+# --no-broadcast-routes to keep the legacy behaviour.
 sleep 2
 sudo ip route replace 26.0.0.0/8 dev "$TAP_DEV"
 echo "[+] Route: 26.0.0.0/8 dev $TAP_DEV (on-link)"
+if [ "$NO_BCAST_ROUTES" = "0" ]; then
+    sudo ip route append 255.255.255.255/32 dev "$TAP_DEV" metric 0 2>/dev/null || true
+    sudo ip route append 224.0.0.0/4        dev "$TAP_DEV" metric 0 2>/dev/null || true
+    echo "[+] Routes: limited broadcast + IPv4 multicast → $TAP_DEV (--no-broadcast-routes to skip)"
+else
+    echo "[*] Skipping broadcast/multicast routes (--no-broadcast-routes)"
+fi
 echo ""
 ip addr show "$TAP_DEV" 2>/dev/null | grep -E "inet |state"
 echo ""
