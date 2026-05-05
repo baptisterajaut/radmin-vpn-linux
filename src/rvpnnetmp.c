@@ -219,6 +219,16 @@ static volatile LONG g_ring_consumed = 0;
 static volatile LONG g_ring_dropped  = 0;
 static volatile LONG g_irp_completed = 0;
 
+/* Scratch buffers for queue compaction. Always accessed while holding
+ * g_irp_queue.Lock — that serialization makes file-scope `static` safe
+ * across the RX thread's broadcast/unicast paths and DispatchCleanup.
+ * Kept off the stack because mingw inserts ___chkstk_ms for >4KB frames,
+ * which the kernel link doesn't resolve. */
+static PIRP         g_compact_keep_irps[IRP_QUEUE_SIZE];
+static PFILE_OBJECT g_compact_keep_fos[IRP_QUEUE_SIZE];
+static PIRP         g_compact_picked[IRP_QUEUE_SIZE];
+static PFILE_OBJECT g_compact_seen[IRP_QUEUE_SIZE];
+
 /* ============ TLV encoding for Read path ============
  *
  * Mode 3: [u32 dest_mac_prefix][u32 frame_len][frame_data (min 60, zero-padded)]
@@ -369,34 +379,38 @@ static void __stdcall rx_thread_proc(PVOID context)
 
         rx_count++;
 
-        /* Log every ICMP frame from TAP (outbound: Linux → peer) */
+        /* Log ICMP frames from TAP (outbound). Rate-limited: first 3, then
+         * every 100th — per-frame logging filled the prefix's drive over
+         * long sessions. Counter still increments unconditionally. */
         if (is_ipv4_icmp(frameBuf, frameLen)) {
             LONG n = InterlockedIncrement(&g_icmp_rx);
-            char buf[64] = "ICMP-OUT #";
-            hex32(buf + 10, (ULONG)n);
-            buf[18] = ' '; buf[19] = 'l'; buf[20] = '=';
-            hex32(buf + 21, (ULONG)frameLen);
-            buf[29] = 0;
-            drv_log(buf);
+            if (n <= 3 || (n % 100) == 0) {
+                char buf[64] = "ICMP-OUT #";
+                hex32(buf + 10, (ULONG)n);
+                buf[18] = ' '; buf[19] = 'l'; buf[20] = '=';
+                hex32(buf + 21, (ULONG)frameLen);
+                buf[29] = 0;
+                drv_log(buf);
+            }
         }
 
         /* Route frame to the correct handle based on dest MAC.
          * PEERMAC IOCTL registered which FILE_OBJECT handles which MAC.
-         * Broadcast frames (FF:FF:FF:FF:FF:FF) go to one IRP per handle. */
+         * Group-addressed frames (broadcast FF:..:FF and any IPv4/IPv6
+         * multicast — bit 0 of the first MAC byte is the group bit) go to
+         * one IRP per handle. */
         {
             KIRQL oldIrql;
             KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
             if (g_irp_queue.Count > 0) {
                 UCHAR *dstMac = frameBuf;  /* first 6 bytes = ethernet dest MAC */
-                int is_bcast = (frameLen >= 6 &&
-                    dstMac[0] == 0xFF && dstMac[1] == 0xFF && dstMac[2] == 0xFF &&
-                    dstMac[3] == 0xFF && dstMac[4] == 0xFF && dstMac[5] == 0xFF);
+                int is_group = (frameLen >= 1 && (dstMac[0] & 0x01));
 
                 /* Find the right FILE_OBJECT for unicast.
                  * Slots with fo == NULL were released by DispatchClose and
                  * will be reused by the next PEERMAC; skip them here. */
                 PFILE_OBJECT target_fo = NULL;
-                if (!is_bcast && frameLen >= 6 && g_peer_routes) {
+                if (!is_group && frameLen >= 6 && g_peer_routes) {
                     LONG rc = g_peer_route_count;
                     if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
                     for (LONG r = 0; r < rc; r++) {
@@ -408,66 +422,71 @@ static void __stdcall rx_thread_proc(PVOID context)
                     }
                 }
 
-                if (is_bcast) {
-                    /* Broadcast: deliver to one IRP per unique FILE_OBJECT.
-                     * Sized to IRP_QUEUE_SIZE so the fanout can't silently
-                     * truncate — with N peers each holding a pending read,
-                     * the queue itself caps the number of distinct FOs.
-                     * Static because only one RX thread ever enters this
-                     * branch, and only while holding g_irp_queue.Lock —
-                     * so no concurrent reuse, and we keep the kernel
-                     * stack small (mingw inserts ___chkstk_ms for >4KB
-                     * frames, which the kernel link doesn't resolve). */
-                    static PIRP batch[IRP_QUEUE_SIZE];
-                    static PFILE_OBJECT seen[IRP_QUEUE_SIZE];
-                    LONG batch_n = 0;
+                if (is_group) {
+                    /* Group address: deliver to one IRP per unique FILE_OBJECT.
+                     * Two-pass partition into picked[] (to be completed) and
+                     * keep_*[] (to be re-installed) avoids the read-then-write
+                     * aliasing that the in-place compaction had when Head != 0
+                     * and the circular index wrapped past freshly written slots. */
+                    LONG picked_n = 0;
                     LONG seen_n = 0;
-                    LONG remaining = 0;
+                    LONG keep_n = 0;
 
                     for (LONG i = 0; i < g_irp_queue.Count; i++) {
                         LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
                         PFILE_OBJECT fo = g_irp_queue.FileObjs[idx];
                         int already = 0;
                         for (LONG s = 0; s < seen_n; s++) {
-                            if (seen[s] == fo) { already = 1; break; }
+                            if (g_compact_seen[s] == fo) { already = 1; break; }
                         }
                         if (!already && seen_n < IRP_QUEUE_SIZE) {
-                            seen[seen_n++] = fo;
-                            batch[batch_n++] = g_irp_queue.Irps[idx];
-                            /* Mark slot as consumed by shifting */
+                            g_compact_seen[seen_n++] = fo;
+                            g_compact_picked[picked_n++] = g_irp_queue.Irps[idx];
                         } else {
-                            /* Keep this IRP in queue (compact later) */
-                            g_irp_queue.Irps[remaining] = g_irp_queue.Irps[idx];
-                            g_irp_queue.FileObjs[remaining] = g_irp_queue.FileObjs[idx];
-                            remaining++;
+                            g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
+                            g_compact_keep_fos[keep_n]  = fo;
+                            keep_n++;
                         }
                     }
-                    g_irp_queue.Head = 0;
-                    g_irp_queue.Tail = remaining;
-                    g_irp_queue.Count = remaining;
+                    for (LONG i = 0; i < keep_n; i++) {
+                        g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
+                        g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
+                    }
+                    g_irp_queue.Head  = 0;
+                    g_irp_queue.Tail  = keep_n;
+                    g_irp_queue.Count = keep_n;
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
-                    for (LONG i = 0; i < batch_n; i++) {
-                        complete_read_irp(batch[i], frameBuf, frameLen);
+                    /* Safe to read g_compact_picked[] without the lock here:
+                     * only the RX thread (single instance) writes it, and we
+                     * don't loop back to ZwReadFile until completion is done. */
+                    for (LONG i = 0; i < picked_n; i++) {
+                        complete_read_irp(g_compact_picked[i], frameBuf, frameLen);
                         InterlockedIncrement(&g_irp_completed);
                     }
                 } else if (target_fo) {
-                    /* Unicast: find IRP from matching FILE_OBJECT */
+                    /* Unicast: find first IRP from matching FILE_OBJECT.
+                     * Same two-pass partition so we never read a slot that
+                     * a previous iteration already overwrote. */
                     PIRP found = NULL;
-                    LONG remaining = 0;
+                    LONG keep_n = 0;
                     for (LONG i = 0; i < g_irp_queue.Count; i++) {
                         LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
                         if (!found && g_irp_queue.FileObjs[idx] == target_fo) {
                             found = g_irp_queue.Irps[idx];
                         } else {
-                            g_irp_queue.Irps[remaining] = g_irp_queue.Irps[idx];
-                            g_irp_queue.FileObjs[remaining] = g_irp_queue.FileObjs[idx];
-                            remaining++;
+                            g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
+                            g_compact_keep_fos[keep_n]  = g_irp_queue.FileObjs[idx];
+                            keep_n++;
                         }
                     }
-                    g_irp_queue.Head = 0;
-                    g_irp_queue.Tail = remaining;
-                    g_irp_queue.Count = remaining;
+                    for (LONG i = 0; i < keep_n; i++) {
+                        g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
+                        g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
+                    }
+                    g_irp_queue.Head  = 0;
+                    g_irp_queue.Tail  = keep_n;
+                    g_irp_queue.Count = keep_n;
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
                     if (found) {
@@ -634,6 +653,72 @@ static NTSTATUS NTAPI DispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             buf[32] = 0;
             drv_log(buf);
         }
+    }
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+/* DispatchCleanup — fired by the I/O manager when the last user-mode
+ * handle to a FILE_OBJECT is closed, BEFORE DispatchClose. We have no
+ * cancel routine on the queued IRPs (Wine doesn't always invoke one
+ * reliably), so without this any pending overlapped Reads against the
+ * closing handle would linger in g_irp_queue forever. Worse, the RX
+ * thread would later try to complete them against a torn-down
+ * FILE_OBJECT — undefined behaviour, and the most likely cause of the
+ * "WineDbg attached to pid …" pop-up reported in the field. */
+static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    (void)DeviceObject;
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+    PFILE_OBJECT fo = sp->FileObject;
+
+    /* Local cancel list lives on the stack (~2 KB) — well under the
+     * mingw chkstk threshold and avoids racing with the RX thread on
+     * the shared g_compact_picked[] static. */
+    PIRP cancel_local[IRP_QUEUE_SIZE];
+    LONG cancel_n = 0;
+
+    if (fo) {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+
+        LONG keep_n = 0;
+        for (LONG i = 0; i < g_irp_queue.Count; i++) {
+            LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
+            if (g_irp_queue.FileObjs[idx] == fo) {
+                if (cancel_n < IRP_QUEUE_SIZE)
+                    cancel_local[cancel_n++] = g_irp_queue.Irps[idx];
+            } else {
+                g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
+                g_compact_keep_fos[keep_n]  = g_irp_queue.FileObjs[idx];
+                keep_n++;
+            }
+        }
+        for (LONG i = 0; i < keep_n; i++) {
+            g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
+            g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
+        }
+        g_irp_queue.Head  = 0;
+        g_irp_queue.Tail  = keep_n;
+        g_irp_queue.Count = keep_n;
+
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+    }
+
+    for (LONG i = 0; i < cancel_n; i++) {
+        cancel_local[i]->IoStatus.Status = STATUS_CANCELLED;
+        cancel_local[i]->IoStatus.Information = 0;
+        IoCompleteRequest(cancel_local[i], IO_NO_INCREMENT);
+    }
+
+    if (cancel_n > 0) {
+        char buf[48] = "CLEANUP cancel=";
+        hex32(buf + 15, (ULONG)cancel_n);
+        buf[23] = 0;
+        drv_log(buf);
     }
 
     Irp->IoStatus.Status = STATUS_SUCCESS;
@@ -990,15 +1075,17 @@ static NTSTATUS NTAPI DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         if (frameLen == 0 || frameLen > RX_FRAME_MAX || offset + frameLen > length)
             break;
 
-        /* Log every inbound ICMP (peer → Linux) */
+        /* Log inbound ICMP (peer → Linux). Rate-limited to first 3 + every 100th. */
         if (is_ipv4_icmp(inBuf + offset, (USHORT)frameLen)) {
             LONG n = InterlockedIncrement(&g_icmp_tx);
-            char buf[64] = "ICMP-IN  #";
-            hex32(buf + 10, (ULONG)n);
-            buf[18] = ' '; buf[19] = 'l'; buf[20] = '=';
-            hex32(buf + 21, (ULONG)frameLen);
-            buf[29] = 0;
-            drv_log(buf);
+            if (n <= 3 || (n % 100) == 0) {
+                char buf[64] = "ICMP-IN  #";
+                hex32(buf + 10, (ULONG)n);
+                buf[18] = ' '; buf[19] = 'l'; buf[20] = '=';
+                hex32(buf + 21, (ULONG)frameLen);
+                buf[29] = 0;
+                drv_log(buf);
+            }
         }
 
         /* Write [u16 len][frame] to FIFO for tap_bridge */
@@ -1112,6 +1199,7 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Registry
 
     DriverObject->MajorFunction[IRP_MJ_CREATE]         = DispatchCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = DispatchClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = DispatchCleanup;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
     DriverObject->MajorFunction[IRP_MJ_READ]            = DispatchRead;
     DriverObject->MajorFunction[IRP_MJ_WRITE]           = DispatchWrite;
