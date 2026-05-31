@@ -727,11 +727,23 @@ static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return STATUS_SUCCESS;
 }
 
-/* IOCTL codes */
+/* IOCTL codes.
+ *
+ * VERSION/STATUS/SETUP/PEERMAC were the original four we reverse-engineered.
+ * STATS/FILTER/PEERPROP were recovered later from the real NetMP60 driver's
+ * dispatch (FUN_140004f48): the genuine driver answers all seven, and newer
+ * RvControlSvc builds poll FILTER (0x224020) as their "is the adapter
+ * operational?" check instead of STATUS. If we leave FILTER on the default
+ * path (STATUS_SUCCESS, Information=0) the service never sees the 1-byte
+ * filter state it expects and loops in "connecting" forever — observed in
+ * the field (GitHub issue #7). So we mirror the real driver's full surface. */
 #define IOCTL_RVPN_VERSION  0x0022c004
 #define IOCTL_RVPN_STATUS   0x00224018
 #define IOCTL_RVPN_SETUP    0x0022801c
 #define IOCTL_RVPN_PEERMAC  0x00228014
+#define IOCTL_RVPN_STATS    0x00224010  /* real: copies 0xB8 bytes of NDIS stats */
+#define IOCTL_RVPN_FILTER   0x00224020  /* real: 1 byte = recv-filter all-packets flag (&0x20) */
+#define IOCTL_RVPN_PEERPROP 0x00228024  /* real: sets a per-peer property, returns Info=1 */
 
 static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -750,6 +762,14 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
         LONG sc = InterlockedIncrement(&dext->StatusCount);
         if (sc <= 3 || (sc % 500) == 0)
             drv_log("IOCTL STATUS poll");
+    } else if (ioctl == IOCTL_RVPN_FILTER) {
+        /* Polled in a tight loop by newer service builds — rate-limit like
+         * STATUS so it doesn't fill the prefix's drive (issue #7 logs were
+         * ~190 lines of nothing but this IOCTL). */
+        static LONG fc = 0;
+        LONG c = InterlockedIncrement(&fc);
+        if (c <= 3 || (c % 500) == 0)
+            drv_log("IOCTL FILTER poll");
     } else {
         drv_log_ioctl(ioctl, inLen, outLen,
                       (const UCHAR *)sysBuffer, inLen < outLen ? outLen : inLen);
@@ -885,6 +905,39 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
                 drv_log(gb);
             }
         }
+        break;
+
+    case IOCTL_RVPN_FILTER:
+        /* Real driver returns (adapter->recv_filter & 0x20), the "all-packets"
+         * bit. Our virtual adapter forwards every frame unconditionally, so we
+         * always report all-packets mode on (0x20). The service uses this as
+         * its operational gate; returning the byte unblocks the connect path. */
+        if (outLen >= 1 && sysBuffer) {
+            *((UCHAR *)sysBuffer) = 0x20;
+            info = 1;
+        }
+        break;
+
+    case IOCTL_RVPN_STATS:
+        /* Real driver copies 0xB8 bytes of NDIS counters. We don't track them —
+         * return a zeroed block so the service's stats poll succeeds rather
+         * than erroring. */
+        if (outLen >= 0xB8 && sysBuffer) {
+            RtlZeroMemory(sysBuffer, 0xB8);
+            info = 0xB8;
+        } else {
+            status = STATUS_BUFFER_TOO_SMALL;
+            info = 0;
+        }
+        break;
+
+    case IOCTL_RVPN_PEERPROP:
+        /* Real driver sets a per-peer property from the input byte and returns
+         * Information=1. We don't model peer objects beyond MAC routing, so we
+         * just acknowledge. */
+        if (outLen >= 1 && sysBuffer)
+            *((UCHAR *)sysBuffer) = 0;
+        info = (outLen >= 1) ? 1 : 0;
         break;
 
     default:
