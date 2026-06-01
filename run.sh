@@ -385,10 +385,26 @@ wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 echo "[*] Waiting for service ready..."
 SERVICE_START=$(date +%s)
 SERVICE_SEEN=0
+READY=0
 for _ in $(seq 1 60); do
     sleep 1
     if [ -f "$LOG" ]; then
         log_txt=$(iconv -f UTF-16LE -t UTF-8 "$LOG" 2>/dev/null || true)
+        # Unsupported-version gate. This project was reverse-engineered against
+        # Radmin VPN 2.0.x. v1.4 registers and opens the adapter but never
+        # reaches "ready" under our shim — it would otherwise hang here until
+        # timeout and then sit at "Connecting..." forever in the GUI.
+        if printf '%s' "$log_txt" | grep -qE 'Service version: *1\.4'; then
+            ver=$(printf '%s' "$log_txt" | grep -oE 'Service version: *[0-9.]+' | head -n1)
+            echo ""
+            echo "[-] Unsupported Radmin VPN version ($ver)."
+            echo "    This project only works with Radmin VPN 2.0.x — 1.4 never"
+            echo "    finishes connecting under the Wine shim."
+            echo "    Fix: delete the wineprefix and reinstall with a 2.0 build:"
+            echo "      rm -rf \"$WINEPREFIX\""
+            echo "      ./run.sh --installer /path/to/Radmin_VPN_2.0.*.exe"
+            exit 1
+        fi
         if printf '%s' "$log_txt" | grep -q 'adapter ready'; then
             vpn_ip=$(printf '%s' "$log_txt" \
                 | grep -E 'Registered as|IP:' \
@@ -397,6 +413,7 @@ for _ in $(seq 1 60); do
                 | tail -n1)
             if [ -n "$vpn_ip" ]; then
                 echo "[+] VPN IP: $vpn_ip"
+                READY=1
                 break
             fi
         fi
@@ -416,6 +433,15 @@ for _ in $(seq 1 60); do
         fi
     fi
 done
+
+# Ready never reached, but the service is still alive (stuck handshake) —
+# surface it instead of silently launching the GUI into a "Connecting..."
+# dead end. This is the alive-but-not-ready case the death checks above miss.
+if [ "$READY" = "0" ]; then
+    dump_diagnostics "Service alive but never became ready (timed out after $(( $(date +%s) - SERVICE_START ))s)"
+    [ "$DIAG_FAILS" -eq 0 ] && retry_verbose
+    exit 1
+fi
 
 # 12. Set up on-link route + broadcast/multicast steering
 # The driver now fans out group-addressed frames (broadcast + IPv4/IPv6

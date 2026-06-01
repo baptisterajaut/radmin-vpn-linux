@@ -34,7 +34,7 @@ Persistent state (wineprefix, MAC, logs) lives in `~/.local/share/radmin-vpn-lin
 - **iconv** (glibc) — for service log parsing
 - **sudo** access — for TAP device creation and routing
 - **TUN/TAP kernel support** — usually built-in, check with `modprobe tun`
-- **Radmin VPN installer** — download from [radmin-vpn.com](https://www.radmin-vpn.com/)
+- **Radmin VPN installer** — download from [radmin-vpn.com](https://www.radmin-vpn.com/). **Must be a 2.0.x build** (developed against 2.0.4899.9). Radmin VPN **1.4 is not supported** — it registers and opens the adapter but never finishes connecting under the Wine shim, leaving the GUI stuck at "Connecting...".
 
 ### Arch Linux
 
