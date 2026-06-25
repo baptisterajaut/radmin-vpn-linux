@@ -291,6 +291,18 @@ cp "$BUILD_DIR/netsh.exe" "$WINEPREFIX/drive_c/windows/syswow64/netsh.exe"
 # no-op stub that returns success.
 cp "$BUILD_DIR/drvinst.exe" "$RADMIN_DIR/drvinst.exe"
 
+# Scrub any real NDIS driver left behind on an ALREADY-poisoned prefix. The
+# fresh-install block above only deletes RvNetMP60 once; a prefix that ran an
+# older build (or a pre-stub drvinst) already has the service + .sys registered,
+# and Wine's PnP would re-start that demand-start (StartType=3) miniport at the
+# next wineserver boot → NdisInitializeReadWriteLock abort all over again (#12).
+# Run it every launch so a poisoned prefix recovers without a reinstall (which
+# would burn a fresh RID — see ban-risk note). Removing the .sys is the key bit:
+# even if a devnode lingers, a missing image fails the load cleanly instead of
+# aborting. Idempotent — safe on a clean prefix.
+wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
+rm -f "$WINEPREFIX/drive_c/windows/system32/drivers/RvNetMP60.sys"
+
 # 4. Generate or load persistent adapter MAC
 if [ -f "$MAC_FILE" ]; then
     ADAPTER_MAC=$(cat "$MAC_FILE")
