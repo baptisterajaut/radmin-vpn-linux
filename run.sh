@@ -139,6 +139,7 @@ dump_diagnostics() {
 
     dump_log "launcher stdout/stderr" /tmp/radmin_service.log
     dump_log "driver log"             "$WINEPREFIX/drive_c/radmin_driver.log"
+    dump_log "adapter_hook log"       "$WINEPREFIX/drive_c/radmin_hook_debug.log"
     dump_log "service log (Famatech)" "$LOG" utf16
     dump_log "tap_bridge log"         /tmp/radmin_bridge.log
 
