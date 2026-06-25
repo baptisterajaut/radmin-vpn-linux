@@ -31,6 +31,7 @@ jobs:
             build/adapter_hook.dll
             build/rvpn_launcher.exe
             build/netsh.exe
+            build/drvinst.exe
             build/tap_bridge
 
       - name: Upload AppImage

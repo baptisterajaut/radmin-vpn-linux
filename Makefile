@@ -4,7 +4,7 @@ MINGW64  = x86_64-w64-mingw32-gcc
 CFLAGS   = -Wall -O2
 BUILD    = build
 
-all: check-deps $(BUILD)/tap_bridge $(BUILD)/rvpnnetmp.sys $(BUILD)/adapter_hook.dll $(BUILD)/rvpn_launcher.exe $(BUILD)/netsh.exe
+all: check-deps $(BUILD)/tap_bridge $(BUILD)/rvpnnetmp.sys $(BUILD)/adapter_hook.dll $(BUILD)/rvpn_launcher.exe $(BUILD)/netsh.exe $(BUILD)/drvinst.exe
 
 $(BUILD)/tap_bridge: src/tap_bridge.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
@@ -24,6 +24,9 @@ $(BUILD)/rvpn_launcher.exe: src/rvpn_launcher.c | $(BUILD)
 
 $(BUILD)/netsh.exe: src/netsh_wrapper.c | $(BUILD)
 	$(MINGW32) $(CFLAGS) -o $@ $< -municode
+
+$(BUILD)/drvinst.exe: src/drvinst.c | $(BUILD)
+	$(MINGW32) $(CFLAGS) -o $@ $<
 
 $(BUILD):
 	mkdir -p $(BUILD)

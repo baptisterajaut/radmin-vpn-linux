@@ -282,6 +282,14 @@ cp "$BUILD_DIR/rvpnnetmp.sys" "$WINEPREFIX/drive_c/windows/system32/drivers/"
 cp "$BUILD_DIR/adapter_hook.dll" "$RADMIN_DIR/"
 cp "$BUILD_DIR/rvpn_launcher.exe" "$RADMIN_DIR/"
 cp "$BUILD_DIR/netsh.exe" "$WINEPREFIX/drive_c/windows/syswow64/netsh.exe"
+# Neutralize Radmin's bundled NDIS driver installer. At runtime RvControlSvc runs
+# "drvinst.exe install ... NetMP60.inf", which re-installs + loads the real NDIS
+# miniport (NetMP60_1_1_64.sys). That driver aborts Wine in DriverEntry via the
+# unimplemented ndis.sys!NdisInitializeReadWriteLock (issue #12). We replace the
+# whole adapter with rvpnnetmp.sys, so the real driver must never load — overwrite
+# drvinst.exe (invoked by bare name from this dir, so the local copy wins) with a
+# no-op stub that returns success.
+cp "$BUILD_DIR/drvinst.exe" "$RADMIN_DIR/drvinst.exe"
 
 # 4. Generate or load persistent adapter MAC
 if [ -f "$MAC_FILE" ]; then

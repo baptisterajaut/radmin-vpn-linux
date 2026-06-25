@@ -2,7 +2,7 @@
 # Builds RadminVPN-Linux-x86_64.AppImage
 #
 # Inputs:  build/ populated with {tap_bridge, rvpnnetmp.sys, adapter_hook.dll,
-#                                  rvpn_launcher.exe, netsh.exe}
+#                                  rvpn_launcher.exe, netsh.exe, drvinst.exe}
 # Output:  packaging/dist/RadminVPN-Linux-x86_64.AppImage
 #
 # Deps:    curl, ImageMagick (convert), appimagetool (auto-downloaded)
@@ -20,7 +20,7 @@ OUT="$DIST/RadminVPN-Linux-x86_64.AppImage"
 echo "[*] radmin-vpn-linux AppImage build"
 
 # ---- Preflight ----
-for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe; do
+for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe drvinst.exe; do
     [ -f "$BUILD/$f" ] || { echo "[-] Missing $BUILD/$f (run 'make' first)"; exit 1; }
 done
 command -v curl    >/dev/null || { echo "[-] curl required"; exit 1; }
@@ -89,6 +89,7 @@ cp "$BUILD/rvpnnetmp.sys"      "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/adapter_hook.dll"   "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/rvpn_launcher.exe"  "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/netsh.exe"          "$APPDIR/usr/lib/radmin-vpn/"
+cp "$BUILD/drvinst.exe"        "$APPDIR/usr/lib/radmin-vpn/"
 chmod +x "$APPDIR/usr/lib/radmin-vpn/tap_bridge"
 
 # run.sh (adapted, lives in the AppImage; sourced via AppRun)
