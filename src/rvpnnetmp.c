@@ -52,30 +52,56 @@ typedef struct _DEVICE_EXTENSION {
 /* Forward decl — we need the device object in the RX thread for TLV encoding */
 static PDEVICE_OBJECT g_DeviceObject = NULL;
 
-/* ============ Logging ============ */
+/* ============ Logging (buffered) ============ */
+
+#define LOG_BUF_SIZE 4096
+
+static HANDLE  g_log_file = NULL;
+static KSPIN_LOCK g_log_lock;
+static CHAR    g_log_buf[LOG_BUF_SIZE];
+static ULONG   g_log_buf_pos = 0;
+static ULONG   g_log_call_count = 0;
+
+/* Flush buffered log data to disk. Caller must hold g_log_lock. */
+static void drv_log_flush_locked(void)
+{
+    if (!g_log_file || g_log_buf_pos == 0)
+        return;
+
+    IO_STATUS_BLOCK iosb;
+    ZwWriteFile(g_log_file, NULL, NULL, NULL, &iosb,
+                g_log_buf, g_log_buf_pos, NULL, NULL);
+    g_log_buf_pos = 0;
+}
 
 static void drv_log(const char *msg)
 {
-    UNICODE_STRING fileName;
-    OBJECT_ATTRIBUTES oa;
-    IO_STATUS_BLOCK iosb;
-    HANDLE hFile;
-    NTSTATUS st;
+    if (!g_log_file)
+        return;
 
-    RtlInitUnicodeString(&fileName, L"\\??\\C:\\radmin_driver.log");
-    InitializeObjectAttributes(&oa, &fileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    ULONG msgLen = 0;
+    const char *p = msg;
+    while (*p++) msgLen++;
 
-    st = ZwCreateFile(&hFile, FILE_APPEND_DATA | SYNCHRONIZE, &oa, &iosb,
-                      NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                      FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
-    if (NT_SUCCESS(st)) {
-        ULONG len = 0;
-        const char *p = msg;
-        while (*p++) len++;
-        ZwWriteFile(hFile, NULL, NULL, NULL, &iosb, (PVOID)msg, len, NULL, NULL);
-        ZwWriteFile(hFile, NULL, NULL, NULL, &iosb, (PVOID)"\r\n", 2, NULL, NULL);
-        ZwClose(hFile);
-    }
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_log_lock, &oldIrql);
+
+    /* Flush first if this message (+ CRLF) would overflow the buffer */
+    if (g_log_buf_pos + msgLen + 2 > LOG_BUF_SIZE)
+        drv_log_flush_locked();
+
+    RtlCopyMemory(g_log_buf + g_log_buf_pos, msg, msgLen);
+    g_log_buf_pos += msgLen;
+    RtlCopyMemory(g_log_buf + g_log_buf_pos, "\r\n", 2);
+    g_log_buf_pos += 2;
+
+    /* Flush every 8 calls so data reaches disk even if we crash before the
+     * buffer fills.  Keeping a counter avoids a ZwWriteFile on every call
+     * while still giving good coverage for a 4 KB buffer. */
+    if (++g_log_call_count % 8 == 0)
+        drv_log_flush_locked();
+
+    KeReleaseSpinLock(&g_log_lock, oldIrql);
 }
 
 static void hex32(char *out, ULONG val)
@@ -162,8 +188,8 @@ static volatile LONG g_icmp_tx = 0;   /* service → TAP (inbound ICMP) */
 #define RX_FRAME_MAX 1600
 
 typedef struct _RX_RING {
-    volatile LONG write_idx;
-    volatile LONG read_idx;
+    volatile ULONG write_idx;
+    volatile ULONG read_idx;
     struct {
         USHORT len;
         UCHAR  data[RX_FRAME_MAX];
@@ -179,7 +205,7 @@ static RX_RING g_rx_ring;
  * completion to the correct ReadFile caller. This is what the real
  * NDIS miniport driver does (confirmed from RE of NetMP60_1_1_64.sys). */
 
-#define IRP_QUEUE_SIZE 256
+#define IRP_QUEUE_SIZE 1024
 
 static struct {
     KSPIN_LOCK Lock;
@@ -492,15 +518,17 @@ static void __stdcall rx_thread_proc(PVOID context)
                     if (found) {
                         complete_read_irp(found, frameBuf, frameLen);
                         InterlockedIncrement(&g_irp_completed);
+                    } else {
+                        static LONG udrop = 0;
+                        if (InterlockedIncrement(&udrop) <= 3)
+                            drv_log("RX unicast no IRP");
                     }
                 } else {
-                    /* No route — fallback: oldest IRP */
-                    PIRP irp = g_irp_queue.Irps[g_irp_queue.Head];
-                    g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
-                    g_irp_queue.Count--;
+                    /* No route — drop */
+                    static LONG ndrop = 0;
+                    if (InterlockedIncrement(&ndrop) <= 3)
+                        drv_log("RX no route");
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-                    complete_read_irp(irp, frameBuf, frameLen);
-                    InterlockedIncrement(&g_irp_completed);
                 }
                 continue;
             }
@@ -508,8 +536,8 @@ static void __stdcall rx_thread_proc(PVOID context)
         }
 
         /* No pending IRP — fall back to ring buffer */
-        LONG widx = g_rx_ring.write_idx;
-        LONG ridx = g_rx_ring.read_idx;
+        ULONG widx = g_rx_ring.write_idx;
+        ULONG ridx = g_rx_ring.read_idx;
         if (widx - ridx >= RX_RING_SIZE) {
             InterlockedIncrement(&g_ring_dropped);
             static LONG drops = 0;
@@ -518,10 +546,10 @@ static void __stdcall rx_thread_proc(PVOID context)
             continue;
         }
 
-        LONG slot = widx % RX_RING_SIZE;
+        ULONG slot = widx % RX_RING_SIZE;
         RtlCopyMemory(g_rx_ring.frames[slot].data, frameBuf, frameLen);
         g_rx_ring.frames[slot].len = frameLen;
-        InterlockedIncrement(&g_rx_ring.write_idx);
+        InterlockedIncrement((volatile LONG *)&g_rx_ring.write_idx);
         InterlockedIncrement(&g_ring_enqueued);
     }
 
@@ -709,9 +737,17 @@ static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     }
 
     for (LONG i = 0; i < cancel_n; i++) {
-        cancel_local[i]->IoStatus.Status = STATUS_CANCELLED;
-        cancel_local[i]->IoStatus.Information = 0;
-        IoCompleteRequest(cancel_local[i], IO_NO_INCREMENT);
+        PIRP irp = cancel_local[i];
+        /* Guard against double-completion: Wine sets Irp->Cancel before
+         * dispatching IRP_MJ_CLEANUP (or races us via CloseHandle's internal
+         * cancellation path).  Calling IoCompleteRequest on an IRP that Wine
+         * is already handling causes a use-after-free (0xc0000005 in ntdll).
+         * If the flag is already set, Wine owns the IRP — skip it. */
+        if (irp->Cancel)
+            continue;
+        irp->IoStatus.Status = STATUS_CANCELLED;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
     }
 
     if (cancel_n > 0) {
@@ -727,23 +763,15 @@ static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return STATUS_SUCCESS;
 }
 
-/* IOCTL codes.
- *
- * VERSION/STATUS/SETUP/PEERMAC were the original four we reverse-engineered.
- * STATS/FILTER/PEERPROP were recovered later from the real NetMP60 driver's
- * dispatch (FUN_140004f48): the genuine driver answers all seven, and newer
- * RvControlSvc builds poll FILTER (0x224020) as their "is the adapter
- * operational?" check instead of STATUS. If we leave FILTER on the default
- * path (STATUS_SUCCESS, Information=0) the service never sees the 1-byte
- * filter state it expects and loops in "connecting" forever — observed in
- * the field (GitHub issue #7). So we mirror the real driver's full surface. */
-#define IOCTL_RVPN_VERSION  0x0022c004
-#define IOCTL_RVPN_STATUS   0x00224018
-#define IOCTL_RVPN_SETUP    0x0022801c
-#define IOCTL_RVPN_PEERMAC  0x00228014
-#define IOCTL_RVPN_STATS    0x00224010  /* real: copies 0xB8 bytes of NDIS stats */
-#define IOCTL_RVPN_FILTER   0x00224020  /* real: 1 byte = recv-filter all-packets flag (&0x20) */
-#define IOCTL_RVPN_PEERPROP 0x00228024  /* real: sets a per-peer property, returns Info=1 */
+/* IOCTL codes — derived from RvNetMP60.sys RE and RvControlSvc.exe call sites */
+#define IOCTL_RVPN_VERSION    0x0022c004  /* in:8B (ver+mac), out:12B */
+#define IOCTL_RVPN_STATUS     0x00224018  /* in:0, out:4B state */
+#define IOCTL_RVPN_CONNECT    0x00224020  /* in:0, out:1B media-connected byte */
+#define IOCTL_RVPN_SETLINK    0x00224010  /* in:0xb8B adapter info, out:0 */
+#define IOCTL_RVPN_SETUP      0x0022801c  /* in:4B mode, out:0 */
+#define IOCTL_RVPN_PEERMAC    0x00228014  /* in:6B MAC, out:0 */
+#define IOCTL_RVPN_SETMAC     0x00228024  /* in/out:various */
+#define IOCTL_RVPN_VERSION2   0x0022c004  /* alias */
 
 static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -762,14 +790,6 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
         LONG sc = InterlockedIncrement(&dext->StatusCount);
         if (sc <= 3 || (sc % 500) == 0)
             drv_log("IOCTL STATUS poll");
-    } else if (ioctl == IOCTL_RVPN_FILTER) {
-        /* Polled in a tight loop by newer service builds — rate-limit like
-         * STATUS so it doesn't fill the prefix's drive (issue #7 logs were
-         * ~190 lines of nothing but this IOCTL). */
-        static LONG fc = 0;
-        LONG c = InterlockedIncrement(&fc);
-        if (c <= 3 || (c % 500) == 0)
-            drv_log("IOCTL FILTER poll");
     } else {
         drv_log_ioctl(ioctl, inLen, outLen,
                       (const UCHAR *)sysBuffer, inLen < outLen ? outLen : inLen);
@@ -802,11 +822,38 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
         break;
 
     case IOCTL_RVPN_STATUS:
+        /* Returns 4-byte NDIS adapter status. Bit 0 = media present/active.
+         * Service checks: if (status != 0 && (status & 1)) → call IOCTL_RVPN_CONNECT.
+         * We report 1 (connected). */
         if (outLen >= 4 && sysBuffer) {
             *((ULONG *)sysBuffer) = 1;
             info = 4;
         }
         break;
+
+    case IOCTL_RVPN_CONNECT:
+        /* Returns 1-byte media-connected state from NDIS adapter status byte.
+         * Real driver returns: adapter_status_byte & 0x20 (NdisMediaStateConnected flag).
+         * Service uses DeviceIoControl(h, 0x224020, NULL, 0, &out, 1, &br, NULL).
+         * If br==0 (no bytes written), DeviceIoControl returns FALSE → service logs
+         * IOCTL failure and sends CDeviceRemoved message → VPN disconnects.
+         * Must write exactly 1 byte to avoid that failure path. 0x20 = connected. */
+        if (outLen >= 1 && sysBuffer) {
+            *((UCHAR *)sysBuffer) = 0x20;  /* NdisMediaStateConnected */
+            info = 1;
+        }
+        break;
+
+    case IOCTL_RVPN_SETLINK:
+        /* Accepts 0xb8 bytes of adapter info from service. No output.
+         * Used to propagate NDIS link info. Accept silently. */
+        break;
+
+    case IOCTL_RVPN_SETMAC:
+        /* Set/query MAC or connection params. Accept silently. */
+        break;
+
+
 
     case IOCTL_RVPN_SETUP:
         if (inLen >= 4 && sysBuffer) {
@@ -907,41 +954,18 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
         }
         break;
 
-    case IOCTL_RVPN_FILTER:
-        /* Real driver returns (adapter->recv_filter & 0x20), the "all-packets"
-         * bit. Our virtual adapter forwards every frame unconditionally, so we
-         * always report all-packets mode on (0x20). The service uses this as
-         * its operational gate; returning the byte unblocks the connect path. */
-        if (outLen >= 1 && sysBuffer) {
-            *((UCHAR *)sysBuffer) = 0x20;
-            info = 1;
-        }
+    default: {
+        /* Log every unhandled IOCTL: these complete with info=0 (no output
+         * bytes), which can make RvControlSvc fire CDeviceRemoved if it
+         * checks br==0 on some periodic poll IOCTL we haven't mapped yet. */
+        char ubuf[64] = "IOCTL_UNKNOWN 0x";
+        hex32(ubuf + 16, ioctl);
+        ubuf[24] = ' '; ubuf[25] = 'o'; ubuf[26] = '=';
+        hex32(ubuf + 27, outLen);
+        ubuf[35] = 0;
+        drv_log(ubuf);
         break;
-
-    case IOCTL_RVPN_STATS:
-        /* Real driver copies 0xB8 bytes of NDIS counters. We don't track them —
-         * return a zeroed block so the service's stats poll succeeds rather
-         * than erroring. */
-        if (outLen >= 0xB8 && sysBuffer) {
-            RtlZeroMemory(sysBuffer, 0xB8);
-            info = 0xB8;
-        } else {
-            status = STATUS_BUFFER_TOO_SMALL;
-            info = 0;
-        }
-        break;
-
-    case IOCTL_RVPN_PEERPROP:
-        /* Real driver sets a per-peer property from the input byte and returns
-         * Information=1. We don't model peer objects beyond MAC routing, so we
-         * just acknowledge. */
-        if (outLen >= 1 && sysBuffer)
-            *((UCHAR *)sysBuffer) = 0;
-        info = (outLen >= 1) ? 1 : 0;
-        break;
-
-    default:
-        break;
+    }
     }
 
     Irp->IoStatus.Status = status;
@@ -967,7 +991,7 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         return STATUS_DEVICE_NOT_CONNECTED;
     }
 
-    LONG ridx = g_rx_ring.read_idx;
+    ULONG ridx = g_rx_ring.read_idx;
 
     if (ridx < g_rx_ring.write_idx) {
         /* Frames available — TLV-encode as many as fit in the buffer */
@@ -985,10 +1009,10 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
         ULONG bufLen = irpSp->Parameters.Read.Length;
         ULONG totalWritten = 0;
-        LONG framesReturned = 0;
+        ULONG framesReturned = 0;
 
         while (ridx < g_rx_ring.write_idx) {
-            LONG slot = ridx % RX_RING_SIZE;
+            ULONG slot = ridx % RX_RING_SIZE;
             USHORT frameLen = g_rx_ring.frames[slot].len;
 
             ULONG written = tlv_encode_frame(outBuf + totalWritten,
@@ -999,7 +1023,7 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                 break;  /* no more room */
 
             totalWritten += written;
-            InterlockedIncrement(&g_rx_ring.read_idx);
+            InterlockedIncrement((volatile LONG *)&g_rx_ring.read_idx);
             InterlockedIncrement(&g_ring_consumed);
             ridx++;
             framesReturned++;
@@ -1037,9 +1061,11 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
             g_irp_queue.Count--;
             KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-            oldIrp->IoStatus.Status = STATUS_CANCELLED;
-            oldIrp->IoStatus.Information = 0;
-            IoCompleteRequest(oldIrp, IO_NO_INCREMENT);
+            if (!oldIrp->Cancel) {
+                oldIrp->IoStatus.Status = STATUS_CANCELLED;
+                oldIrp->IoStatus.Information = 0;
+                IoCompleteRequest(oldIrp, IO_NO_INCREMENT);
+            }
             KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
         }
         {
@@ -1186,9 +1212,11 @@ static VOID NTAPI Unload(PDRIVER_OBJECT DriverObject)
             g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
             g_irp_queue.Count--;
             KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-            irp->IoStatus.Status = STATUS_CANCELLED;
-            irp->IoStatus.Information = 0;
-            IoCompleteRequest(irp, IO_NO_INCREMENT);
+            if (!irp->Cancel) {
+                irp->IoStatus.Status = STATUS_CANCELLED;
+                irp->IoStatus.Information = 0;
+                IoCompleteRequest(irp, IO_NO_INCREMENT);
+            }
             KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
         }
         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
@@ -1205,6 +1233,18 @@ static VOID NTAPI Unload(PDRIVER_OBJECT DriverObject)
         ExFreePoolWithTag(g_peer_routes, PEER_ROUTES_TAG);
         g_peer_routes = NULL;
         g_peer_routes_capacity = 0;
+    }
+
+    /* Flush and close log file */
+    {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&g_log_lock, &oldIrql);
+        drv_log_flush_locked();
+        KeReleaseSpinLock(&g_log_lock, oldIrql);
+    }
+    if (g_log_file) {
+        ZwClose(g_log_file);
+        g_log_file = NULL;
     }
 }
 
@@ -1235,8 +1275,29 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Registry
     deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 
     RtlZeroMemory(deviceObject->DeviceExtension, sizeof(DEVICE_EXTENSION));
+    RtlZeroMemory(&g_rx_ring, sizeof(g_rx_ring));
     g_DeviceObject = deviceObject;
     KeInitializeSpinLock(&g_irp_queue.Lock);
+    KeInitializeSpinLock(&g_log_lock);
+
+    /* Open log file once; drv_log buffers writes to avoid per-call I/O */
+    {
+        UNICODE_STRING fileName;
+        /* Use Wine's \??\unix\... extension: maps directly to a Linux path,
+         * bypassing the drive-letter translation that fails for regular files
+         * in Wine's fake kernel-mode ZwCreateFile implementation. */
+        RtlInitUnicodeString(&fileName, L"\\??\\unix\\tmp\\radmin_driver.log");
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &fileName, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        IO_STATUS_BLOCK iosb;
+        /* OBJ_KERNEL_HANDLE is intentionally omitted: Wine's ntdll does not
+         * honour it in kernel-driver context and silently fails ZwCreateFile
+         * when it is present, leaving g_log_file NULL and all drv_log() calls
+         * as silent no-ops.  Omitting it lets Wine open the file normally. */
+        ZwCreateFile(&g_log_file, FILE_APPEND_DATA | SYNCHRONIZE, &oa, &iosb,
+                     NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                     FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    }
 
     /* Allocate the initial peer-routes table. Kept small — the table
      * grows on demand via PEERMAC when real peer counts require it. */

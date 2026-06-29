@@ -20,14 +20,26 @@ int main(int argc, char *argv[])
 
     snprintf(cmdline, sizeof(cmdline), "%s\\RvControlSvc.exe", exe_dir);
 
-    /* Build command line with original args */
+    /* Build command line with original args (with bounds checking) */
     for (i = 1; i < argc; i++) {
+        size_t current_len = strlen(cmdline);
+        size_t arg_len = strlen(argv[i]);
+        size_t space_needed = arg_len + 1; /* +1 for space */
+        
+        if (current_len + space_needed >= sizeof(cmdline)) {
+            printf("Error: Command line too long (max %zu bytes)\n", sizeof(cmdline));
+            return 1;
+        }
+        
         strcat(cmdline, " ");
         strcat(cmdline, argv[i]);
     }
 
-    /* Create the service process suspended */
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+    /* Create the service process suspended.
+     * bInheritHandles=TRUE so the child's stderr (Wine +seh crash backtrace)
+     * flows to our stdout/stderr → /tmp/radmin_service.log when WINEDEBUG
+     * exposes the seh channel. */
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
                         CREATE_SUSPENDED, NULL, exe_dir, &si, &pi)) {
         printf("CreateProcess failed: %lu\n", GetLastError());
         return 1;

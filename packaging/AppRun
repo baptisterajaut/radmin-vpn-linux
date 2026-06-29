@@ -32,9 +32,13 @@ export WINELOADER="$APPDIR/wine/bin/wine"
 export WINESERVER="$APPDIR/wine/bin/wineserver"
 
 # ---- Env for run.sh ----
+# run.sh reads WINEPREFIX and BUILD_DIR from environment when set.
+# We override them here so everything is self-contained within the AppImage
+# and the persistent data dir.
 export WINEPREFIX="$DATA_DIR/wineprefix"
 export BUILD_DIR="$APPDIR/usr/lib/radmin-vpn"
 export RADMIN_DATA_DIR="$DATA_DIR"
+export RADMIN_INSTALLER_URL="https://download.radmin-vpn.com/download/files/Radmin_VPN_2.0.4899.9.exe"
 
 # ---- Askpass: native binary, else synthesize via zenity/kdialog ----
 if [ -z "${SUDO_ASKPASS:-}" ] && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then

@@ -13,10 +13,14 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
+#define NETSH_CMD_DELAY_MS    1500
+#define NETSH_ENABLE_DELAY_MS  500
+
 /* Convert wide string arg to narrow */
 static char *to_narrow(const WCHAR *w) {
     int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
     char *buf = malloc(len + 1);
+    if (!buf) return NULL;
     WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, len + 1, NULL, NULL);
     return buf;
 }
@@ -45,6 +49,20 @@ int wmain(int argc, WCHAR *argv[])
     /* Reconstruct command line */
     for (i = 1; i < argc; i++) {
         char *a = to_narrow(argv[i]);
+        if (!a) continue;
+        
+        size_t current_len = strlen(cmdline);
+        size_t arg_len = strlen(a);
+        size_t space_needed = arg_len + 1; /* +1 for space */
+        
+        if (i > 1) space_needed += 1; /* Account for the space we'll add */
+        
+        if (current_len + space_needed >= sizeof(cmdline)) {
+            fprintf(stderr, "netsh_wrapper: command line too long\n");
+            free(a);
+            break;
+        }
+        
         if (i > 1) strcat(cmdline, " ");
         strcat(cmdline, a);
         free(a);
@@ -58,15 +76,20 @@ int wmain(int argc, WCHAR *argv[])
     /* Also: "interface set interface XXX ENABLE" */
     /* Also: "interface ipv6 add address interface=XXX address=YYY" */
 
-    if (strstr(cmdline, "interface") && strstr(cmdline, "add address")) {
+    if (strstr(cmdline, "interface") &&
+        (strstr(cmdline, "add address") || strstr(cmdline, "set address"))) {
         char *p;
-        /* Extract addr= */
-        p = strstr(cmdline, "addr=");
-        if (!p) p = strstr(cmdline, "address=");
-        if (p) {
-            p = strchr(p, '=') + 1;
-            addr = p;
-            char *end = strchr(p, ' ');
+        /* Extract addr= or address= (use address= first for "set address") */
+        if (strstr(cmdline, "set address")) {
+            p = strstr(cmdline, "address=");
+            if (p) { p = strchr(p, '=') + 1; addr = p; }
+        } else {
+            p = strstr(cmdline, "addr=");
+            if (!p) p = strstr(cmdline, "address=");
+            if (p) { p = strchr(p, '=') + 1; addr = p; }
+        }
+        if (addr) {
+            char *end = strchr(addr, ' ');
             if (end) *end = '\0';
         }
         /* Extract mask= */
@@ -103,7 +126,7 @@ int wmain(int argc, WCHAR *argv[])
                                "ip link set radminvpn0 up 2>/dev/null\n",
                             addr, cidr);
                     fclose(f);
-                    Sleep(1500);
+                    Sleep(NETSH_CMD_DELAY_MS);
                 }
             }
             return 0;
@@ -112,7 +135,7 @@ int wmain(int argc, WCHAR *argv[])
 
     if (strstr(cmdline, "interface set interface") && strstr(cmdline, "ENABLE")) {
         FILE *f = _wfopen(L"Z:\\tmp\\radmin_netsh_cmd", L"a");
-        if (f) { fprintf(f, "ip link set radminvpn0 up\n"); fclose(f); Sleep(500); }
+        if (f) { fprintf(f, "ip link set radminvpn0 up\n"); fclose(f); Sleep(NETSH_ENABLE_DELAY_MS); }
         return 0;
     }
 
@@ -129,7 +152,7 @@ int wmain(int argc, WCHAR *argv[])
                 fprintf(f, "ip -6 addr add %s/128 dev radminvpn0 2>/dev/null\n", p);
                 fclose(f);
                 spy_log("ipv6 add: %s", p);
-                Sleep(1500);
+                Sleep(NETSH_CMD_DELAY_MS);
             }
         }
         return 0;
@@ -137,7 +160,7 @@ int wmain(int argc, WCHAR *argv[])
 
     if (strstr(cmdline, "interface ip delete") && strstr(cmdline, "address")) {
         FILE *f = _wfopen(L"Z:\\tmp\\radmin_netsh_cmd", L"a");
-        if (f) { fprintf(f, "ip addr flush dev radminvpn0\n"); fclose(f); Sleep(500); }
+        if (f) { fprintf(f, "ip addr flush dev radminvpn0\n"); fclose(f); Sleep(NETSH_ENABLE_DELAY_MS); }
         return 0;
     }
 

@@ -73,6 +73,19 @@ On subsequent runs, just:
 ./run.sh
 ```
 
+### Command-line flags
+
+| Flag | Description |
+|------|-------------|
+| `--installer <path>` | Path to the `Radmin_VPN_*.exe` installer (first run only). |
+| `--no-ui` | Run the service without launching the Radmin GUI. |
+| `--no-broadcast-routes` | Don't add the broadcast/multicast → TAP routes. |
+| `--filter-ui` | Launch the optional GTK4 packet-filter UI (off by default). |
+| `--fix-chat` | Patch Qt's `qwindows.dll` to fix the chat-window crash under Wine (off by default). |
+
+Both `--filter-ui` and `--fix-chat` are opt-in. The filter UI needs the `rvpn_filter_ui`
+binary (built by `make`); the chat fix needs `patch_qwindows_font.py` and a Python 3 interpreter.
+
 ## Building from source
 
 Requires `mingw-w64` cross-compilers. Pre-built binaries are available from [Releases](https://github.com/baptisterajaut/radmin-vpn-linux/releases) (built by CI on each tagged version) if you don't want to install mingw.
