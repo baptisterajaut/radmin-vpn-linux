@@ -1,11 +1,43 @@
+# Build artifacts
 build/
-wineprefix/
+packaging/dist/
+*.o
+*.a
+*.so
+
+# Compiled Windows binaries (in root, not src/)
 *.sys
 *.dll
 *.exe
 !src/*.c
+
+# Native binaries
 tap_bridge
+rvpn_filter_ui
+
+# Wine prefix
+wineprefix/
+
+# Logs
 *.log
-*.o
+/tmp/radmin_*
+
+# Editor files
 .*.kate-swp
-packaging/dist/
+.*.swp
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/rvpn_*
+
+# Memory dumps
+wine_memory_monitor.txt

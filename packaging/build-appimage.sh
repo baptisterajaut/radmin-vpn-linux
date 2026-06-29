@@ -1,8 +1,9 @@
 #!/bin/bash
 # Builds RadminVPN-Linux-x86_64.AppImage
 #
-# Inputs:  build/ populated with {tap_bridge, rvpnnetmp.sys, adapter_hook.dll,
-#                                  rvpn_launcher.exe, netsh.exe, drvinst.exe}
+# Inputs:  build/ populated with {tap_bridge, rvpn_filter_ui,
+#                                  rvpnnetmp.sys, adapter_hook.dll,
+#                                  rvpn_launcher.exe, netsh.exe, netsh64.exe}
 # Output:  packaging/dist/RadminVPN-Linux-x86_64.AppImage
 #
 # Deps:    curl, ImageMagick (convert), appimagetool (auto-downloaded)
@@ -20,7 +21,7 @@ OUT="$DIST/RadminVPN-Linux-x86_64.AppImage"
 echo "[*] radmin-vpn-linux AppImage build"
 
 # ---- Preflight ----
-for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe drvinst.exe; do
+for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe netsh64.exe drvinst.exe; do
     [ -f "$BUILD/$f" ] || { echo "[-] Missing $BUILD/$f (run 'make' first)"; exit 1; }
 done
 command -v curl    >/dev/null || { echo "[-] curl required"; exit 1; }
@@ -89,8 +90,22 @@ cp "$BUILD/rvpnnetmp.sys"      "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/adapter_hook.dll"   "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/rvpn_launcher.exe"  "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/netsh.exe"          "$APPDIR/usr/lib/radmin-vpn/"
+cp "$BUILD/netsh64.exe"        "$APPDIR/usr/lib/radmin-vpn/"
 cp "$BUILD/drvinst.exe"        "$APPDIR/usr/lib/radmin-vpn/"
 chmod +x "$APPDIR/usr/lib/radmin-vpn/tap_bridge"
+
+# rvpn_filter_ui is optional (GTK4 Linux binary) — bundle if present
+if [ -f "$BUILD/rvpn_filter_ui" ]; then
+    cp "$BUILD/rvpn_filter_ui" "$APPDIR/usr/lib/radmin-vpn/"
+    chmod +x "$APPDIR/usr/lib/radmin-vpn/rvpn_filter_ui"
+    echo "[*] Bundled rvpn_filter_ui"
+else
+    echo "[!] rvpn_filter_ui not found in build/ — skipping (--no-ui will be implied)"
+fi
+
+# Radmin VPN Windows installer is intentionally NOT bundled — it is downloaded
+# at runtime (RADMIN_INSTALLER_URL). Never ship the proprietary installer inside
+# the AppImage.
 
 # run.sh (adapted, lives in the AppImage; sourced via AppRun)
 cp "$ROOT/run.sh" "$APPDIR/usr/bin/run.sh"
