@@ -361,6 +361,27 @@ static void complete_read_irp(PIRP irp, const UCHAR *frame, USHORT frameLen)
 
 /* ============ RX thread ============ */
 
+/* Read exactly n bytes from the FIFO, looping over partial reads.
+ * The FIFO is a blocking pipe: a single read() returns as soon as >=1 byte is
+ * available, NOT the full count — so under high packet influx a lone ZwReadFile
+ * routinely comes back short. Treating that as fatal (the old code did) killed
+ * the RX thread and left RvControlSvc waiting on overlapped reads that never
+ * complete ("service online but loses the driver"). Loop until all n bytes are
+ * in; only a hard error or writer-closed (0 bytes) ends the stream. */
+static NTSTATUS fifo_read_exact(HANDLE fifo, void *buf, ULONG n)
+{
+    IO_STATUS_BLOCK iosb;
+    ULONG got = 0;
+    while (got < n) {
+        NTSTATUS st = ZwReadFile(fifo, NULL, NULL, NULL, &iosb,
+                                 (UCHAR *)buf + got, n - got, NULL, NULL);
+        if (!NT_SUCCESS(st)) return st;
+        if (iosb.Information == 0) return STATUS_END_OF_FILE;  /* writer closed */
+        got += (ULONG)iosb.Information;
+    }
+    return STATUS_SUCCESS;
+}
+
 static void __stdcall rx_thread_proc(PVOID context)
 {
     HANDLE fifo = (HANDLE)context;
@@ -374,9 +395,8 @@ static void __stdcall rx_thread_proc(PVOID context)
     while (1) {
         USHORT frameLen = 0;
 
-        st = ZwReadFile(fifo, NULL, NULL, NULL, &iosb,
-                        &frameLen, sizeof(frameLen), NULL, NULL);
-        if (!NT_SUCCESS(st) || iosb.Information != sizeof(frameLen)) {
+        st = fifo_read_exact(fifo, &frameLen, sizeof(frameLen));
+        if (!NT_SUCCESS(st)) {
             char buf[96] = "RX exit: st=0x";
             hex32(buf + 14, (ULONG)st);
             char *p = buf + 22;
@@ -398,9 +418,8 @@ static void __stdcall rx_thread_proc(PVOID context)
             continue;
         }
 
-        st = ZwReadFile(fifo, NULL, NULL, NULL, &iosb,
-                        frameBuf, frameLen, NULL, NULL);
-        if (!NT_SUCCESS(st) || iosb.Information != frameLen)
+        st = fifo_read_exact(fifo, frameBuf, frameLen);
+        if (!NT_SUCCESS(st))
             break;
 
         rx_count++;
