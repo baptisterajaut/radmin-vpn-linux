@@ -845,12 +845,25 @@ static NTSTATUS NTAPI DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Ir
         break;
 
     case IOCTL_RVPN_SETLINK:
-        /* Accepts 0xb8 bytes of adapter info from service. No output.
-         * Used to propagate NDIS link info. Accept silently. */
+        /* Real NetMP60 answers this with a 0xB8-byte stats/link block (RE'd:
+         * in=0 out=0xB8). If the service polls it expecting output and checks
+         * br, a 0-byte completion can trip CDeviceRemoved (see CONNECT/default
+         * comments). Mirror the genuine driver: zeroed 0xB8 block when the
+         * caller gave us the buffer, otherwise succeed silently. */
+        if (outLen >= 0xB8 && sysBuffer) {
+            RtlZeroMemory(sysBuffer, 0xB8);
+            info = 0xB8;
+        }
         break;
 
     case IOCTL_RVPN_SETMAC:
-        /* Set/query MAC or connection params. Accept silently. */
+        /* Real NetMP60 answers this per-peer property IOCTL with Information=1
+         * (RE'd: out=1). Acknowledge the same way so a br-checking service does
+         * not treat it as a failure. Accept silently if no output buffer. */
+        if (outLen >= 1 && sysBuffer) {
+            *((UCHAR *)sysBuffer) = 0;
+            info = 1;
+        }
         break;
 
 

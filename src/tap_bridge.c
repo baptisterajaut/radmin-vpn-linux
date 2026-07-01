@@ -77,6 +77,11 @@ static int               g_have_local_ip = 0;
 #define FIFO_D2B        "/tmp/rvpn_d2b"
 #define MTU             1500
 #define FRAME_MAX       (MTU + 14 + 4)
+/* The Wine driver (rvpnnetmp.c) bounds d2b frames by RX_FRAME_MAX (1600), which
+ * exceeds FRAME_MAX. Size the relay buffer to that ceiling (+ margin) so an
+ * oversized frame is read in full rather than desyncing the FIFO or killing the
+ * relay loop. Keep in sync with rvpnnetmp.c RX_FRAME_MAX. */
+#define RELAY_BUF_MAX   2048
 
 static volatile int running = 1;
 
@@ -641,7 +646,7 @@ int main(int argc, char *argv[])
     fprintf(stderr, "tap_bridge: FIFOs connected! Relaying frames.\n");
 
     /* Relay loop */
-    uint8_t buf[FRAME_MAX];
+    uint8_t buf[RELAY_BUF_MAX];
     fd_set rfds;
     int maxfd = (tap_fd > d2b_fd) ? tap_fd : d2b_fd;
 
@@ -704,8 +709,11 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "tap_bridge: d2b read len failed (driver disconnected?)\n");
                 break;
             }
-            if (len > FRAME_MAX) {
-                fprintf(stderr, "tap_bridge: bad frame len %u\n", len);
+            if (len > sizeof(buf)) {
+                /* Larger than the driver could legitimately emit (RX_FRAME_MAX):
+                 * the FIFO stream is corrupt, bail. Frames in (FRAME_MAX,
+                 * RX_FRAME_MAX] are read normally below — they no longer kill us. */
+                fprintf(stderr, "tap_bridge: corrupt frame len %u > %zu\n", len, sizeof(buf));
                 break;
             }
             if (read_exact(d2b_fd, buf, len) < 0) {
@@ -727,11 +735,8 @@ int main(int argc, char *argv[])
             /* Replicate multicast 224.0.2.60 as broadcast 26.255.255.255 */
             replicate_mcast_to_bcast(tap_fd, buf, len, 0);
             drv_to_tap++;
-            if (drv_to_tap <= 5 || (drv_to_tap % 100) == 0) {
-                fprintf(stderr, "tap_bridge: drv→TAP #%lu (%u bytes) hex: ", drv_to_tap, len);
-                for(int i=0; i < (len < 32 ? len : 32); i++) fprintf(stderr, "%02x ", buf[i]);
-                fprintf(stderr, "\n");
-            }
+            if (drv_to_tap <= 5 || (drv_to_tap % 100) == 0)
+                fprintf(stderr, "tap_bridge: drv→TAP #%lu (%u bytes)\n", drv_to_tap, len);
             skip_drv_to_tap: ;
         }
     }

@@ -16,6 +16,33 @@
 #define NETSH_CMD_DELAY_MS    1500
 #define NETSH_ENABLE_DELAY_MS  500
 
+/* The parsed address is interpolated into a shell command run as root by the
+ * relay (run.sh: sudo sh -c). Validate it strictly at this trust boundary so no
+ * shell metacharacter can ever reach the relay, regardless of what the service
+ * hands us. IPv4: exactly four 0-255 octets. IPv6: hex digits and ':' only. */
+static int valid_ipv4(const char *s) {
+    int octets = 0;
+    while (octets < 4) {
+        int val = 0, digits = 0;
+        while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); digits++; s++; if (val > 255) return 0; }
+        if (digits == 0) return 0;
+        octets++;
+        if (octets < 4) { if (*s != '.') return 0; s++; }
+    }
+    return (*s == '\0') && (octets == 4);
+}
+
+static int valid_ipv6_chars(const char *s) {
+    if (!*s) return 0;
+    for (; *s; s++) {
+        char c = *s;
+        int ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                 (c >= 'A' && c <= 'F') || c == ':';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
 /* Convert wide string arg to narrow */
 static char *to_narrow(const WCHAR *w) {
     int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
@@ -116,6 +143,14 @@ int wmain(int argc, WCHAR *argv[])
                 return 0;
             }
 
+            /* Reject anything that is not a clean dotted-quad before it reaches
+             * the root relay (defence against shell-metachar injection). */
+            if (!valid_ipv4(addr)) {
+                spy_log("rejecting non-IPv4 addr: %s", addr);
+                fprintf(stderr, "netsh_wrapper: rejecting non-IPv4 addr\n");
+                return 0;
+            }
+
             /* Write command to relay file — a background Linux process
              * with sudo will pick it up and execute it. Wine can't
              * run ip commands directly. Use Z: drive = / on Linux. */
@@ -147,6 +182,12 @@ int wmain(int argc, WCHAR *argv[])
             if (end) *end = '\0';
             /* Skip fe80 link-local */
             if (strstr(p, "fe80")) { spy_log("skipping link-local v6 %s", p); return 0; }
+            /* Reject anything outside the IPv6 charset before the root relay. */
+            if (!valid_ipv6_chars(p)) {
+                spy_log("rejecting non-IPv6 addr: %s", p);
+                fprintf(stderr, "netsh_wrapper: rejecting non-IPv6 addr\n");
+                return 0;
+            }
             FILE *f = _wfopen(L"Z:\\tmp\\radmin_netsh_cmd", L"a");
             if (f) {
                 fprintf(f, "ip -6 addr add %s/128 dev radminvpn0 2>/dev/null\n", p);

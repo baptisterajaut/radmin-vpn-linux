@@ -414,24 +414,29 @@ fi
 #                          down. Use this to identify the crashing call site.
 #   QT_QUICK_BACKEND    -> e.g. "software" to force raster (unrelated to this bug,
 #                          left unset by default now).
-[ -n "${QT_QUICK_BACKEND:-}" ] && export QT_QUICK_BACKEND
-_gui_winedebug="-all"
-if [ "${RVPN_GUI_DEBUG:-0}" = "1" ]; then
-    _gui_winedebug="${WINE_GUI_DEBUG:-+seh,+tid}"
-fi
-if [ "${RVPN_GUI_WINEDBG:-0}" = "1" ]; then
-    # Batch-drive winedbg over stdin: "c" runs the GUI; on an unhandled fault
-    # winedbg regains control and we dump backtraces, then quit. Captures the
-    # crashing call site (module+offset+return addresses) to /tmp/radmin_gui.log.
-    printf 'c\ninfo share\nbt\nbt all\nquit\n' \
-        | WINEDEBUG=-all winedbg "C:\\Program Files (x86)\\Radmin VPN\\RvRvpnGui.exe" \
-        > /tmp/radmin_gui.log 2>&1 &
+GUI_PID=""
+if [ "$NO_UI" -eq 0 ]; then
+    [ -n "${QT_QUICK_BACKEND:-}" ] && export QT_QUICK_BACKEND
+    _gui_winedebug="-all"
+    if [ "${RVPN_GUI_DEBUG:-0}" = "1" ]; then
+        _gui_winedebug="${WINE_GUI_DEBUG:-+seh,+tid}"
+    fi
+    if [ "${RVPN_GUI_WINEDBG:-0}" = "1" ]; then
+        # Batch-drive winedbg over stdin: "c" runs the GUI; on an unhandled fault
+        # winedbg regains control and we dump backtraces, then quit. Captures the
+        # crashing call site (module+offset+return addresses) to /tmp/radmin_gui.log.
+        printf 'c\ninfo share\nbt\nbt all\nquit\n' \
+            | WINEDEBUG=-all winedbg "C:\\Program Files (x86)\\Radmin VPN\\RvRvpnGui.exe" \
+            > /tmp/radmin_gui.log 2>&1 &
+    else
+        LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+            WINEDEBUG="$_gui_winedebug" \
+            wine RvRvpnGui.exe > /tmp/radmin_gui.log 2>&1 &
+    fi
+    GUI_PID=$!
 else
-    LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
-        WINEDEBUG="$_gui_winedebug" \
-        wine RvRvpnGui.exe > /tmp/radmin_gui.log 2>&1 &
+    echo "[*] --no-ui: GUI not launched (service runs headless)"
 fi
-GUI_PID=$!
 
 # Packet-filter UI is opt-in via --filter-ui (and never with --no-ui).
 if [ "$FILTER_UI" -eq 1 ] && [ "$NO_UI" -eq 0 ] && [ -x "$BUILD_DIR/rvpn_filter_ui" ]; then
@@ -442,4 +447,10 @@ fi
 echo "Radmin VPN - service active"
 
 
-wait $GUI_PID || true
+if [ -n "$GUI_PID" ]; then
+    wait "$GUI_PID" || true
+else
+    # Headless: no GUI to wait on — block on the service instead so cleanup
+    # (trap) still fires on Ctrl+C / service exit.
+    wait || true
+fi

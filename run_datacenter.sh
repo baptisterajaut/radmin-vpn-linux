@@ -1,7 +1,8 @@
 #!/bin/bash
 # run_datacenter.sh - Radmin VPN Datacenter Edition
 # Runs on headless VPS (no display server) using Xvfb + noVNC for web-based GUI access
-# Usage: ./run_datacenter.sh [--installer /path/to/Radmin_VPN_*.exe] [--vnc-port PORT] [--web-port PORT] [--vnc-password PASS]
+# Usage: ./run_datacenter.sh [--installer /path/to/Radmin_VPN_*.exe] [--vnc-port PORT] [--web-port PORT] [--vnc-password PASS] [--web-bind ADDR]
+#   --web-bind ADDR  noVNC listen address (default 127.0.0.1; use 0.0.0.0 to expose publicly, only with --vnc-password)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -39,6 +40,9 @@ VNC_PORT=5900
 WEB_PORT=6080
 VNC_PASSWORD=""
 NOVNC_PATH=""
+# Web (noVNC) bind address. Default 127.0.0.1 = reachable only via SSH tunnel.
+# Pass --web-bind 0.0.0.0 to expose it publicly (only with --vnc-password!).
+WEB_BIND="127.0.0.1"
 
 # PIDs for cleanup
 XVFB_PID=""
@@ -60,6 +64,8 @@ for arg in "$@"; do
         --web-port=*) WEB_PORT="${arg#*=}" ;;
         --vnc-password) shift; VNC_PASSWORD="$1"; shift ;;
         --vnc-password=*) VNC_PASSWORD="${arg#*=}" ;;
+        --web-bind) shift; WEB_BIND="$1"; shift ;;
+        --web-bind=*) WEB_BIND="${arg#*=}" ;;
     esac
 done
 
@@ -182,8 +188,12 @@ if [ -n "$VNC_PASSWORD" ]; then
     x11vnc -storepasswd "$VNC_PASSWORD" /tmp/rvpn_vnc_password 2>/dev/null
     VNC_ARGS+=(-rfbauth /tmp/rvpn_vnc_password)
     echo "[+] VNC password set"
+elif [ "$WEB_BIND" != "127.0.0.1" ] && [ "$WEB_BIND" != "localhost" ]; then
+    echo "[!] DANGER: no VNC password AND web bind is $WEB_BIND (public)."
+    echo "    Anyone reaching :$WEB_PORT gets an unauthenticated root-capable desktop."
+    echo "    Set --vnc-password, or drop --web-bind to keep it on 127.0.0.1 (SSH-tunnel only)."
 else
-    echo "[!] WARNING: VNC has no password. Use --vnc-password for security."
+    echo "[*] VNC has no password but web is bound to $WEB_BIND (reach via SSH tunnel: ssh -L $WEB_PORT:localhost:$WEB_PORT ...)."
 fi
 
 x11vnc "${VNC_ARGS[@]}" > /tmp/radmin_x11vnc.log 2>&1 &
@@ -198,7 +208,7 @@ echo "[+] VNC server running (pid=$X11VNC_PID, port=$VNC_PORT)"
 
 # ── 4. Start noVNC (web-based VNC client) ──
 echo "[*] Starting noVNC on port $WEB_PORT..."
-websockify --web="$NOVNC_PATH" 0.0.0.0:"$WEB_PORT" localhost:"$VNC_PORT" > /tmp/radmin_novnc.log 2>&1 &
+websockify --web="$NOVNC_PATH" "$WEB_BIND":"$WEB_PORT" localhost:"$VNC_PORT" > /tmp/radmin_novnc.log 2>&1 &
 WEBSOCKIFY_PID=$!
 sleep 1
 
@@ -265,6 +275,16 @@ cp "$BUILD_DIR/adapter_hook.dll" "$RADMIN/"
 cp "$BUILD_DIR/rvpn_launcher.exe" "$RADMIN/"
 cp "$BUILD_DIR/netsh.exe" "$WINEPREFIX/drive_c/windows/syswow64/netsh.exe"
 cp "$BUILD_DIR/netsh64.exe" "$WINEPREFIX/drive_c/windows/system32/netsh.exe"
+# Replace Radmin's real NDIS driver installer with a no-op stub.
+# RvControlSvc runs drvinst.exe at runtime to load NetMP60_1_1_64.sys, which
+# aborts Wine 11.x via NdisInitializeReadWriteLock (issue #12). Our rvpnnetmp.sys
+# replaces that adapter, so the real NDIS driver must never load.
+cp "$BUILD_DIR/drvinst.exe" "$RADMIN/drvinst.exe"
+
+# Scrub any real NDIS driver left behind on a poisoned prefix (run every launch
+# so an already-poisoned prefix recovers without reinstall).
+wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
+rm -f "$WINEPREFIX/drive_c/windows/system32/drivers/RvNetMP60.sys"
 
 # ── 7. Generate or load persistent adapter MAC ──
 if [ -f "$MAC_FILE" ]; then

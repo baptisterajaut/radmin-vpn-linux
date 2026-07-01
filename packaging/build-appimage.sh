@@ -111,6 +111,10 @@ fi
 cp "$ROOT/run.sh" "$APPDIR/usr/bin/run.sh"
 chmod +x "$APPDIR/usr/bin/run.sh"
 
+# patch_qwindows_font.py — run.sh's --fix-chat looks for it next to itself
+# ($DIR/patch_qwindows_font.py). Without this it silently no-ops in the AppImage.
+cp "$ROOT/patch_qwindows_font.py" "$APPDIR/usr/bin/patch_qwindows_font.py"
+
 # AppRun
 cp "$PACK/AppRun" "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
