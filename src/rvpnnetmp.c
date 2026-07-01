@@ -243,7 +243,16 @@ static volatile LONG g_peer_route_count = 0;
 static volatile LONG g_ring_enqueued = 0;
 static volatile LONG g_ring_consumed = 0;
 static volatile LONG g_ring_dropped  = 0;
-static volatile LONG g_irp_completed = 0;
+/* Observability counters. With the cancel-safe-queue mechanism (see
+ * RvpnCancelRoutine) these are benign, not bug indicators:
+ *  - g_rx_cancel_ceded:  a dequeuer (RX thread / cleanup / drop) found the
+ *    cancel routine had already claimed the IRP and correctly ceded ownership.
+ *  - g_irp_cancelled:    IRPs completed as STATUS_CANCELLED by the cancel routine.
+ *  - g_queue_full_drops: IRP queue hit capacity and the oldest was dropped. */
+static volatile LONG g_rx_cancel_ceded  = 0;
+static volatile LONG g_irp_cancelled    = 0;
+static volatile LONG g_queue_full_drops = 0;
+static volatile LONG g_irp_completed    = 0;
 
 /* Scratch buffers for queue compaction. Always accessed while holding
  * g_irp_queue.Lock — that serialization makes file-scope `static` safe
@@ -382,6 +391,104 @@ static NTSTATUS fifo_read_exact(HANDLE fifo, void *buf, ULONG n)
     return STATUS_SUCCESS;
 }
 
+/* ============ Cancel-safe IRP queue ============
+ *
+ * Every queued Read IRP carries a cancel routine (armed in DispatchRead). When
+ * Wine cancels an IRP — on CancelIoEx, on the service closing a per-peer handle,
+ * or on abrupt process exit — the I/O manager atomically clears Irp->CancelRoutine
+ * and invokes RvpnCancelRoutine, which removes the IRP from the queue and
+ * completes it as STATUS_CANCELLED. (Verified on Wine 11.x: the routine fires in
+ * all three cases, Irp->CancelRoutine is NULL on entry, and IoSetCancelRoutine
+ * returns the previously-armed routine — the exchange semantics the handshake
+ * below relies on.)
+ *
+ * Ownership of a given IRP is decided by a single atomic exchange of
+ * Irp->CancelRoutine:
+ *   - the I/O manager wins  -> RvpnCancelRoutine completes the IRP;
+ *   - a dequeuer wins (IoSetCancelRoutine(irp, NULL) returns non-NULL via
+ *     rx_claim_irp)         -> that dequeuer completes the IRP.
+ * Exactly one side ever completes a given IRP, so the double-completion UAF the
+ * old Irp->Cancel polling was prone to (freed IRP recycled into the service's
+ * STATUS poll -> spurious FALSE -> "adapter removed" storm) cannot happen. */
+
+/* Remove a specific IRP from the queue (compacting). Caller holds the queue
+ * lock. Uses the shared g_compact_keep_* scratch, safe because the lock
+ * serializes every compaction path. Returns TRUE if the IRP was present. */
+static BOOLEAN dequeue_specific_irp_locked(PIRP irp)
+{
+    LONG keep_n = 0;
+    BOOLEAN found = FALSE;
+    for (LONG i = 0; i < g_irp_queue.Count; i++) {
+        LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
+        if (!found && g_irp_queue.Irps[idx] == irp) {
+            found = TRUE;
+        } else {
+            g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
+            g_compact_keep_fos[keep_n]  = g_irp_queue.FileObjs[idx];
+            keep_n++;
+        }
+    }
+    if (found) {
+        for (LONG i = 0; i < keep_n; i++) {
+            g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
+            g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
+        }
+        g_irp_queue.Head  = 0;
+        g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;
+        g_irp_queue.Count = keep_n;
+    }
+    return found;
+}
+
+/* Cancel routine: the I/O manager calls this (global cancel spinlock held, and
+ * Irp->CancelRoutine already NULL'd) when it cancels a queued Read IRP. */
+static VOID NTAPI RvpnCancelRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    (void)DeviceObject;
+    /* Release the global cancel spinlock before taking our private queue lock;
+     * the two are never nested (dequeuers only ever hold the queue lock, and
+     * detach via a lock-free IoSetCancelRoutine), so there is no lock-order
+     * inversion. */
+    IoReleaseCancelSpinLock(Irp->CancelIrql);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+    dequeue_specific_irp_locked(Irp);   /* remove if still queued */
+    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+    /* We own this IRP: the I/O manager only reaches here after atomically
+     * clearing CancelRoutine, so no dequeuer can also claim it. */
+    Irp->IoStatus.Status = STATUS_CANCELLED;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    LONG c = InterlockedIncrement(&g_irp_cancelled);
+    if (c <= 5 || (c % 100) == 0) {
+        char buf[32] = "IRP cancelled #";
+        hex32(buf + 15, (ULONG)c);
+        buf[23] = 0;
+        drv_log(buf);
+    }
+}
+
+/* Called by a dequeuer (RX thread / cleanup / queue-full drop / unload) that
+ * has pulled an IRP off the queue and wants to complete it. Detaches the cancel
+ * routine; returns TRUE if this caller now owns completion, FALSE if the cancel
+ * routine already claimed the IRP (it will complete it — the caller must skip). */
+static BOOLEAN rx_claim_irp(PIRP irp)
+{
+    if (IoSetCancelRoutine(irp, NULL) != NULL)
+        return TRUE;
+    LONG c = InterlockedIncrement(&g_rx_cancel_ceded);
+    if (c <= 5 || (c % 100) == 0) {
+        char buf[32] = "RX cancel-ceded #";
+        hex32(buf + 17, (ULONG)c);
+        buf[25] = 0;
+        drv_log(buf);
+    }
+    return FALSE;
+}
+
 static void __stdcall rx_thread_proc(PVOID context)
 {
     HANDLE fifo = (HANDLE)context;
@@ -498,7 +605,7 @@ static void __stdcall rx_thread_proc(PVOID context)
                         g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
                     }
                     g_irp_queue.Head  = 0;
-                    g_irp_queue.Tail  = keep_n;
+                    g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;  /* wrap: keep_n can == IRP_QUEUE_SIZE */
                     g_irp_queue.Count = keep_n;
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
@@ -506,8 +613,12 @@ static void __stdcall rx_thread_proc(PVOID context)
                      * only the RX thread (single instance) writes it, and we
                      * don't loop back to ZwReadFile until completion is done. */
                     for (LONG i = 0; i < picked_n; i++) {
-                        complete_read_irp(g_compact_picked[i], frameBuf, frameLen);
-                        InterlockedIncrement(&g_irp_completed);
+                        /* Claim ownership before completing; if the cancel
+                         * routine already took it, skip — it will complete it. */
+                        if (rx_claim_irp(g_compact_picked[i])) {
+                            complete_read_irp(g_compact_picked[i], frameBuf, frameLen);
+                            InterlockedIncrement(&g_irp_completed);
+                        }
                     }
                 } else if (target_fo) {
                     /* Unicast: find first IRP from matching FILE_OBJECT.
@@ -530,13 +641,15 @@ static void __stdcall rx_thread_proc(PVOID context)
                         g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
                     }
                     g_irp_queue.Head  = 0;
-                    g_irp_queue.Tail  = keep_n;
+                    g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;  /* wrap: keep_n can == IRP_QUEUE_SIZE */
                     g_irp_queue.Count = keep_n;
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
                     if (found) {
-                        complete_read_irp(found, frameBuf, frameLen);
-                        InterlockedIncrement(&g_irp_completed);
+                        if (rx_claim_irp(found)) {
+                            complete_read_irp(found, frameBuf, frameLen);
+                            InterlockedIncrement(&g_irp_completed);
+                        }
                     } else {
                         static LONG udrop = 0;
                         if (InterlockedIncrement(&udrop) <= 3)
@@ -709,13 +822,13 @@ static NTSTATUS NTAPI DispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 }
 
 /* DispatchCleanup — fired by the I/O manager when the last user-mode
- * handle to a FILE_OBJECT is closed, BEFORE DispatchClose. We have no
- * cancel routine on the queued IRPs (Wine doesn't always invoke one
- * reliably), so without this any pending overlapped Reads against the
- * closing handle would linger in g_irp_queue forever. Worse, the RX
- * thread would later try to complete them against a torn-down
- * FILE_OBJECT — undefined behaviour, and the most likely cause of the
- * "WineDbg attached to pid …" pop-up reported in the field. */
+ * handle to a FILE_OBJECT is closed, BEFORE DispatchClose. Queued IRPs now
+ * carry a cancel routine, so Wine usually cancels a closing handle's pending
+ * Reads (via RvpnCancelRoutine) before this runs. This pass is the
+ * belt-and-braces sweep for any IRP of the FILE_OBJECT the cancel routine
+ * didn't already claim, so none can linger in g_irp_queue and later be
+ * completed against a torn-down FILE_OBJECT. Ownership is arbitrated by
+ * rx_claim_irp, so there is no double completion. */
 static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     (void)DeviceObject;
@@ -749,7 +862,7 @@ static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
         }
         g_irp_queue.Head  = 0;
-        g_irp_queue.Tail  = keep_n;
+        g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;  /* wrap: keep_n can == IRP_QUEUE_SIZE */
         g_irp_queue.Count = keep_n;
 
         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
@@ -757,16 +870,14 @@ static NTSTATUS NTAPI DispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     for (LONG i = 0; i < cancel_n; i++) {
         PIRP irp = cancel_local[i];
-        /* Guard against double-completion: Wine sets Irp->Cancel before
-         * dispatching IRP_MJ_CLEANUP (or races us via CloseHandle's internal
-         * cancellation path).  Calling IoCompleteRequest on an IRP that Wine
-         * is already handling causes a use-after-free (0xc0000005 in ntdll).
-         * If the flag is already set, Wine owns the IRP — skip it. */
-        if (irp->Cancel)
-            continue;
-        irp->IoStatus.Status = STATUS_CANCELLED;
-        irp->IoStatus.Information = 0;
-        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        /* On handle close Wine may already have cancelled these via the cancel
+         * routine. Claim ownership first; only complete the ones we win — the
+         * rest the cancel routine completes. Prevents the double-completion UAF. */
+        if (rx_claim_irp(irp)) {
+            irp->IoStatus.Status = STATUS_CANCELLED;
+            irp->IoStatus.Information = 0;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+        }
     }
 
     if (cancel_n > 0) {
@@ -1088,12 +1199,21 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
         if (g_irp_queue.Count >= IRP_QUEUE_SIZE) {
-            /* Queue full — drop oldest IRP */
+            /* Queue full — drop oldest IRP. Logged because reaching capacity is
+             * the gate for the compaction Tail-wrap (Finding 2); if this never
+             * fires under load, that path is not in play. */
+            LONG qf = InterlockedIncrement(&g_queue_full_drops);
             PIRP oldIrp = g_irp_queue.Irps[g_irp_queue.Head];
             g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
             g_irp_queue.Count--;
             KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-            if (!oldIrp->Cancel) {
+            if (qf <= 5 || (qf % 100) == 0) {
+                char buf[32] = "IRP queue full #";
+                hex32(buf + 16, (ULONG)qf);
+                buf[24] = 0;
+                drv_log(buf);
+            }
+            if (rx_claim_irp(oldIrp)) {
                 oldIrp->IoStatus.Status = STATUS_CANCELLED;
                 oldIrp->IoStatus.Information = 0;
                 IoCompleteRequest(oldIrp, IO_NO_INCREMENT);
@@ -1107,6 +1227,20 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         g_irp_queue.Irps[g_irp_queue.Tail] = Irp;
         g_irp_queue.Tail = (g_irp_queue.Tail + 1) % IRP_QUEUE_SIZE;
         g_irp_queue.Count++;
+
+        /* Arm the cancel routine, then run the textbook enqueue race guard: if
+         * the IRP was already cancelled before we armed, reclaim ownership and
+         * complete it here; otherwise a later cancel goes through the routine.
+         * IoSetCancelRoutine is a lock-free exchange, safe under the queue lock. */
+        IoSetCancelRoutine(Irp, RvpnCancelRoutine);
+        if (Irp->Cancel && IoSetCancelRoutine(Irp, NULL) != NULL) {
+            dequeue_specific_irp_locked(Irp);
+            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+            Irp->IoStatus.Status = STATUS_CANCELLED;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_PENDING;
+        }
         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
     }
 
@@ -1244,7 +1378,7 @@ static VOID NTAPI Unload(PDRIVER_OBJECT DriverObject)
             g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
             g_irp_queue.Count--;
             KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-            if (!irp->Cancel) {
+            if (rx_claim_irp(irp)) {
                 irp->IoStatus.Status = STATUS_CANCELLED;
                 irp->IoStatus.Information = 0;
                 IoCompleteRequest(irp, IO_NO_INCREMENT);
