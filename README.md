@@ -18,6 +18,8 @@ Linux app ← TAP (radminvpn0) ← tap_bridge ← FIFO ← rvpnnetmp.sys (Wine d
 
 Grab `RadminVPN-Linux-x86_64.AppImage` from the [latest release](https://github.com/baptisterajaut/radmin-vpn-linux/releases/latest). Nothing to install — Wine is bundled.
 
+> **Release candidates** (e.g. `v1.0.0-rc1`) are published as GitHub *pre-releases*. The `latest` link above always points to the newest *stable* build, so pre-releases won't appear there — grab those from the [full releases list](https://github.com/baptisterajaut/radmin-vpn-linux/releases).
+
 ```bash
 chmod +x RadminVPN-Linux-x86_64.AppImage
 ./RadminVPN-Linux-x86_64.AppImage
@@ -86,6 +88,42 @@ On subsequent runs, just:
 Both `--filter-ui` and `--fix-chat` are opt-in. The filter UI needs the `rvpn_filter_ui`
 binary (built by `make`); the chat fix needs `patch_qwindows_font.py` and a Python 3 interpreter.
 
+## Headless / server modes
+
+Two extra launchers run Radmin VPN without a local desktop — for a VPS or datacenter host. Both install and configure exactly like `run.sh` (same wineprefix, same `--installer` first-run flow, same TAP bridge); they only differ in how the GUI is reached.
+
+### `run_datacenter.sh` — GUI over the browser
+
+Runs the real Radmin GUI on a virtual display (Xvfb) and serves it through VNC + noVNC, so you can configure your networks from a browser and then leave it running.
+
+```bash
+sudo apt install -y xvfb x11vnc websockify novnc   # or: make install-datacenter-deps
+./run_datacenter.sh --installer ~/Downloads/Radmin_VPN_*.exe
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vnc-port <n>` | `5900` | Port for the x11vnc server. |
+| `--web-port <n>` | `6080` | Port for the noVNC web endpoint. |
+| `--vnc-password <pw>` | *(none)* | Password for the VNC / web session. |
+| `--web-bind <addr>` | `127.0.0.1` | Address noVNC listens on. |
+
+By default noVNC binds to `127.0.0.1`, so it's only reachable through an SSH tunnel:
+
+```bash
+ssh -L 6080:localhost:6080 your-vps    # then open http://localhost:6080/vnc.html
+```
+
+To expose it publicly, pass `--web-bind 0.0.0.0` **together with** `--vnc-password` — otherwise anyone who reaches the web port lands on an unauthenticated, root-capable desktop. The script prints a loud warning if you bind publicly without a password.
+
+### `run_vps.sh` — service only, fixed GUID
+
+Starts the service headless with a hardcoded TAP GUID (no Wine WMI required) and no GUI at all. If a custom network enumerator (`rv_net_enum.exe`, not shipped in this repo) is present one directory up, it is launched; otherwise the service just runs until you Ctrl+C. Only `--installer` is accepted.
+
+```bash
+./run_vps.sh --installer ~/Downloads/Radmin_VPN_*.exe
+```
+
 ## Building from source
 
 Requires `mingw-w64` cross-compilers. Pre-built binaries are available from [Releases](https://github.com/baptisterajaut/radmin-vpn-linux/releases) (built by CI on each tagged version) if you don't want to install mingw.
@@ -99,8 +137,11 @@ Produces:
 - `build/rvpnnetmp.sys` — Wine kernel driver (64-bit PE)
 - `build/adapter_hook.dll` — Hook DLL (32-bit PE)
 - `build/rvpn_launcher.exe` — DLL injector (32-bit PE)
-- `build/netsh.exe` — netsh replacement (32-bit PE)
+- `build/netsh.exe` — netsh replacement (32-bit PE, installed to SysWOW64)
+- `build/netsh64.exe` — netsh replacement (64-bit PE, installed to System32)
+- `build/drvinst.exe` — no-op stub replacing Radmin's real NDIS driver installer (issue #12)
 - `build/tap_bridge` — native Linux TAP bridge
+- `build/rvpn_filter_ui` — optional GTK4 packet-filter UI (`--filter-ui`)
 
 ### Building the AppImage
 
@@ -126,12 +167,14 @@ The wineprefix is stored in `./wineprefix/` (source run) or `~/.local/share/radm
 | `rvpnnetmp.sys` | Wine kernel driver. Emulates the Radmin NDIS miniport. Handles IOCTLs (VERSION, STATUS, SETUP, PEERMAC), TLV frame encoding/decoding, IRP queue for overlapped I/O, MAC-based frame routing for multi-peer support. |
 | `adapter_hook.dll` | Companion DLL loaded alongside RvControlSvc.exe. IAT hooks: renames TAP adapter to match Radmin's expected name, no-ops `RegSetKeySecurity` to work around a Wine SCM bug where services lack the SYSTEM SID. |
 | `tap_bridge` | Native Linux binary. Relays ethernet frames between the TAP device and named pipes (FIFOs) that the Wine driver reads/writes. |
-| `netsh.exe` | Replaces Wine's netsh stub. Translates Windows `netsh interface ip` commands to Linux `ip addr`/`ip link` commands via a file-based relay. |
+| `netsh.exe` / `netsh64.exe` | Replaces Wine's netsh stub (32-bit in SysWOW64, 64-bit in System32). Translates Windows `netsh interface ip` commands to Linux `ip addr`/`ip link` commands via a file-based relay, validating the address before it reaches the root relay. |
 | `rvpn_launcher.exe` | Injects `adapter_hook.dll` into the Radmin service process via `CreateRemoteThread` + `LoadLibrary`. |
+| `drvinst.exe` | No-op stub replacing Radmin's real NDIS driver installer. Radmin runs it at runtime to load `NetMP60_1_1_64.sys`, which aborts Wine 11.x via `NdisInitializeReadWriteLock` (issue #12); since our driver already replaces that adapter, the real one must never load. |
+| `rvpn_filter_ui` | Optional GTK4 UI to inspect and filter the packets crossing the bridge. Off by default; launch with `--filter-ui`. |
 
 ## Troubleshooting
 
-**GUI stuck on "Waiting for adapter"**: the driver isn't loading. Check that `wineprefix/drive_c/radmin_driver.log` exists and has content. If empty, the driver service registration may be missing — delete the wineprefix and re-run.
+**GUI stuck on "Waiting for adapter"**: the driver isn't loading. Check that `/tmp/radmin_driver.log` exists and has content. If empty, the driver service registration may be missing — delete the wineprefix and re-run.
 
 **Service dies immediately**: check `/tmp/radmin_service.log` for Wine errors. Common cause: old wineprefix from a different Wine version. Delete `./wineprefix/` and re-run.
 
