@@ -105,20 +105,12 @@ static void fix_ip_checksum(uint8_t *frame)
     frame[25] = csum & 0xFF;
 }
 
-/* Write a frame to either FIFO ([len16][frame]) or TAP (raw frame).
- * For the FIFO the length prefix and frame are coalesced into a single
- * write_exact so we issue one pipe syscall per frame instead of two — the
- * driver's RX thread reassembles by the length framing regardless, and one
- * writer means there is no interleaving to worry about. */
+/* Write a frame to either FIFO ([len16][frame]) or TAP (raw frame) */
 static int write_frame(int fd, const uint8_t *data, uint16_t len, int is_fifo)
 {
     if (is_fifo) {
-        uint8_t framed[2 + RELAY_BUF_MAX];
-        if ((size_t)len > sizeof(framed) - 2)
-            return 0;
-        memcpy(framed, &len, 2);
-        memcpy(framed + 2, data, len);
-        if (write_exact(fd, framed, (size_t)len + 2) < 0)
+        if (write_exact(fd, &len, 2) < 0 ||
+            write_exact(fd, data, len) < 0)
             return 0;
     } else {
         if (write_exact(fd, data, len) < 0)
@@ -696,7 +688,8 @@ int main(int argc, char *argv[])
                  * resolution delays cause the first 2 pings to drop. */
                 try_arp_reply(tap_fd, buf, len);
                 if (should_drop_frame(buf, len, 0)) goto skip_tap_to_drv;
-                if (!write_frame(b2d_fd, buf, len, 1)) {
+                if (write_exact(b2d_fd, &len, 2) < 0 ||
+                    write_exact(b2d_fd, buf, len) < 0) {
                     fprintf(stderr, "tap_bridge: b2d write failed\n");
                     break;
                 }
