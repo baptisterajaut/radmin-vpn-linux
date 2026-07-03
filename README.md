@@ -180,7 +180,7 @@ The wineprefix is stored in `./wineprefix/` (source run) or `~/.local/share/radm
 
 **0% packet loss with one peer, high loss with many**: this was the original bug — fixed by MAC-based frame routing in the driver. Make sure you're using the latest build.
 
-**First ping is slow (~1s)**: normal — it's ARP resolution through the VPN tunnel. Subsequent pings are 40-80ms depending on peer distance.
+**First ping is slow (~1s)**: the latest version caches MAC addresses for every IP packet the driver sees. If the target IP has sent at least one packet while the driver was running, the MAC is already cached and there's zero ARP delay. Only completely silent peers (those that have never sent a packet) require the initial ARP resolution, which adds ~1 second.
 
 **LAN games don't see other peers / "auto-discovery" broken**: most LAN games discover each other with broadcast probes (UDP to `255.255.255.255`) or multicast (`224.0.0.0/4`). On Windows the Radmin TAP driver advertises itself as the preferred interface for those flows; on Linux you have to tell the kernel explicitly. `run.sh` now installs two extra routes when the VPN comes up:
 
@@ -205,8 +205,6 @@ The routes are scoped to the TAP device, so they're auto-removed when `run.sh` t
 - Older Wine versions (< 11.0) may have different overlapped I/O behavior that breaks the driver
 
 ## Notes
-
-**Ban risk.** Each fresh wineprefix creates a new registration ID with Famatech's servers. Don't delete and recreate your wineprefix unnecessarily. Reuse it across sessions.
 
 **Wine bug workaround.** The `RegSetKeySecurity` hook works around a [known Wine limitation](https://forum.winehq.org/viewtopic.php?t=37183) where services don't receive the SYSTEM SID (S-1-5-18). This may be fixed upstream in a future Wine release.
 
