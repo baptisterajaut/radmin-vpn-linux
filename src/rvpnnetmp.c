@@ -184,7 +184,13 @@ static volatile LONG g_icmp_tx = 0;   /* service → TAP (inbound ICMP) */
 /* RX_RING is a fallback used only when no overlapped ReadFile IRP is pending.
  * In steady state with a running service every frame is delivered via IRP, so
  * the ring is almost always empty — 16 slots (~26 KB) is more than enough. */
-#define RX_RING_SIZE 16
+/* Fallback ring for inbound frames that arrive with no pending Read IRP to
+ * complete. At 16 slots this overflowed under multi-peer load, dropping frames;
+ * a dropped frame on a TCP peer connection triggers a retransmission timeout
+ * (~200ms–1s), which is a large chunk of the observed under-load latency. 128
+ * slots (≈200 KB NonPaged) absorbs bursts while the service catches up. The
+ * ring is only a fallback — healthy operation completes into pending IRPs. */
+#define RX_RING_SIZE 128
 #define RX_FRAME_MAX 1600
 
 typedef struct _RX_RING {
@@ -229,6 +235,7 @@ static struct {
 #define PEER_ROUTES_INITIAL 16
 #define PEER_ROUTES_MAX     4096
 #define PEER_ROUTES_TAG     'rPvR'  /* "RvPr" backwards: pool tags are printed LE */
+#define D2B_STAGING_TAG     'wD2R'  /* "R2Dw" backwards: DispatchWrite coalesce buffer */
 
 typedef struct _PEER_ROUTE {
     PFILE_OBJECT fo;
@@ -1287,10 +1294,24 @@ static NTSTATUS NTAPI DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         return STATUS_SUCCESS;
     }
 
-    /* Parse TLV and relay each frame to FIFO */
+    /* Parse the TLV frames the service handed us and coalesce them into one
+     * staging buffer, then relay with a SINGLE ZwWriteFile. The old path did
+     * two blocking ZwWriteFile per frame; under Wine each is a pipe syscall, so
+     * a service IRP carrying F frames cost 2F syscalls in the single IRP-dispatch
+     * context — the dominant term in outbound latency and the backpressure that
+     * stalls tap_bridge. The service already batches many frames per write, so
+     * collapsing them back to one syscall is the biggest outbound lever.
+     *
+     * The staging buffer is sized to `length`: each frame emits [u16 len][frame]
+     * (2 + frameLen) while consuming at least 4 + frameLen of input, so the
+     * output can never exceed the input length. On pool-alloc failure we fall
+     * back to the per-frame double-write (correct, just slow). */
     ULONG offset = 0;
     ULONG mode = ext->SetupMode;
     LONG frameCount = 0;
+
+    UCHAR *staging = (UCHAR *)ExAllocatePoolWithTag(NonPagedPool, length, D2B_STAGING_TAG);
+    ULONG stagePos = 0;
 
     while (offset < length) {
         /* Mode >= 2: skip 4-byte mac prefix */
@@ -1333,15 +1354,30 @@ static NTSTATUS NTAPI DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
         }
 
-        /* Write [u16 len][frame] to FIFO for tap_bridge */
+        /* Emit [u16 len][frame] — into the staging buffer if we have one,
+         * else fall back to two direct writes. */
         USHORT fifoLen = (USHORT)frameLen;
-        ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
-                    &fifoLen, sizeof(fifoLen), NULL, NULL);
-        ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
-                    inBuf + offset, frameLen, NULL, NULL);
+        if (staging) {
+            RtlCopyMemory(staging + stagePos, &fifoLen, sizeof(fifoLen));
+            stagePos += sizeof(fifoLen);
+            RtlCopyMemory(staging + stagePos, inBuf + offset, frameLen);
+            stagePos += frameLen;
+        } else {
+            ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
+                        &fifoLen, sizeof(fifoLen), NULL, NULL);
+            ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
+                        inBuf + offset, frameLen, NULL, NULL);
+        }
 
         offset += frameLen;
         frameCount++;
+    }
+
+    if (staging) {
+        if (stagePos > 0)
+            ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
+                        staging, stagePos, NULL, NULL);
+        ExFreePoolWithTag(staging, D2B_STAGING_TAG);
     }
 
     static LONG write_ok = 0;
