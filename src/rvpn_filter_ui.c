@@ -554,7 +554,7 @@ static void on_activate(GtkApplication *gtk_app, gpointer user_data)
     gtk_widget_set_margin_bottom(vbox, 8);
 
     /* Seção 1: Bloquear IPs */
-    GtkWidget *ip_card = make_section("Bloquear Endereços IP",
+    GtkWidget *ip_card = make_section("Block IP Addresses",
                                       "ex: 26.1.2.3",
                                       &app.block_ips,
                                       &app.ip_switch, &app.ip_entry, &app.ip_list);
@@ -564,7 +564,7 @@ static void on_activate(GtkApplication *gtk_app, gpointer user_data)
     gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
     /* Seção 2: Bloquear MACs */
-    GtkWidget *mac_card = make_section("Bloquear Endereços MAC",
+    GtkWidget *mac_card = make_section("Block MAC Addresses",
                                        "ex: aa:bb:cc:dd:ee:ff",
                                        &app.block_macs,
                                        &app.mac_switch, &app.mac_entry, &app.mac_list);
@@ -574,7 +574,7 @@ static void on_activate(GtkApplication *gtk_app, gpointer user_data)
     gtk_box_append(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
     /* Seção 3: Bloquear Broadcast */
-    GtkWidget *bcast_card = make_section("Bloquear Broadcast (UDP:4445)",
+    GtkWidget *bcast_card = make_section("Block Minecraft Broadcast (UDP:4445)",
                                          "ex: 26.10.20.30",
                                          &app.block_broadcast,
                                          &app.bcast_switch, &app.bcast_entry, &app.bcast_list);
