@@ -27,8 +27,10 @@
 #define DOSDEVICE_NAME  L"\\DosDevices\\RVPNNETMP"
 
 /* FIFO paths (Wine Z: drive maps to /) */
-#define FIFO_B2D_PATH   L"\\??\\Z:\\tmp\\rvpn_b2d"
-#define FIFO_D2B_PATH   L"\\??\\Z:\\tmp\\rvpn_d2b"
+#define FIFO_B2D_PATH       L"\\??\\Z:\\tmp\\rvpn_b2d"
+#define FIFO_D2B_PATH       L"\\??\\Z:\\tmp\\rvpn_d2b"
+#define FIFO_D2B_HIGH_PATH  L"\\??\\Z:\\tmp\\rvpn_d2b_high"
+#define FIFO_D2B_LOW_PATH   L"\\??\\Z:\\tmp\\rvpn_d2b_low"
 
 /* Adapter MAC — loaded from /tmp/rvpn_mac (6 raw bytes, written by run.sh).
  * Must match the TAP device MAC. Falls back to a default if file missing. */
@@ -44,9 +46,11 @@ typedef struct _DEVICE_EXTENSION {
     UCHAR   MacAddress[6];
     LONG    IoctlCount;
     LONG    StatusCount;
-    ULONG   SetupMode;   /* Set by SETUP IOCTL (0x22801c), controls TLV format */
-    HANDLE  FifoB2D;     /* bridge→driver (read incoming frames) */
-    HANDLE  FifoD2B;     /* driver→bridge (write outgoing frames) */
+    ULONG   SetupMode;       /* Set by SETUP IOCTL (0x22801c), controls TLV format */
+    HANDLE  FifoB2D;         /* bridge→driver (read incoming frames) */
+    HANDLE  FifoD2B;         /* legacy single pipe — kept unused for compat */
+    HANDLE  FifoD2B_High;    /* driver→bridge high priority (TCP/ICMP/unicast UDP) */
+    HANDLE  FifoD2B_Low;     /* driver→bridge low priority (broadcast/multicast/rest) */
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 /* Forward decl — we need the device object in the RX thread for TLV encoding */
@@ -174,6 +178,56 @@ static int is_ipv4_icmp(const UCHAR *frame, USHORT len)
     if (frame[12] != 0x08 || frame[13] != 0x00) return 0;
     /* IP protocol at offset 23: 1 = ICMP */
     return (frame[23] == 1);
+}
+
+/* ============ Dual-priority FIFO classifier ============
+ * Classify an outgoing ethernet frame for driver→bridge priority.
+ * Returns 1 for high priority (TCP, ICMP, unicast UDP), 0 for low
+ * priority (broadcasts, multicasts, non-IP, unknown).
+ *
+ * High priority classification:
+ *   IPv4: TCP(6), ICMP(1), unicast UDP(17)
+ *   IPv6: TCP(6), ICMPv6(58), unicast UDP(17)
+ * Everything else → low priority.
+ */
+static int classify_high_priority(const UCHAR *frame, USHORT len)
+{
+    if (len < 14) return 0;
+
+    USHORT ethertype = ((USHORT)frame[12] << 8) | frame[13];
+
+    /* ARP is critical for reachability; keep it out of the broadcast queue. */
+    if (ethertype == 0x0806)
+        return 1;
+
+    if (ethertype == 0x0800) {
+        /* IPv4: need eth + 20-byte IP header to read protocol */
+        if (len < 34) return 0;
+        UCHAR proto = frame[23];
+        if (proto == 6 || proto == 1) {
+            return 1;  /* TCP or ICMP → high */
+        }
+        if (proto == 17) {
+            /* Unicast UDP: dst MAC group bit cleared */
+            return !(frame[0] & 0x01);
+        }
+        return 0;
+    }
+
+    if (ethertype == 0x86dd) {
+        /* IPv6: need eth + 40-byte IPv6 header to read next header */
+        if (len < 54) return 0;
+        UCHAR proto = frame[20];  /* next header at eth[14] + ipv6[6] */
+        if (proto == 6 || proto == 58) {
+            return 1;  /* TCP or ICMPv6 → high */
+        }
+        if (proto == 17) {
+            return !(frame[0] & 0x01);
+        }
+        return 0;
+    }
+
+    return 0;  /* non-IP or ARP → low priority */
 }
 
 static volatile LONG g_icmp_rx = 0;   /* TAP → service (outbound ICMP) */
@@ -768,9 +822,13 @@ static NTSTATUS NTAPI DispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
         }
     }
-    if (!ext->FifoD2B) {
-        ext->FifoD2B = open_fifo(FIFO_D2B_PATH, FILE_WRITE_DATA);
-        if (ext->FifoD2B) drv_log("FIFO d2b opened");
+    if (!ext->FifoD2B_High) {
+        ext->FifoD2B_High = open_fifo(FIFO_D2B_HIGH_PATH, FILE_WRITE_DATA);
+        if (ext->FifoD2B_High) drv_log("FIFO d2b_high opened");
+    }
+    if (!ext->FifoD2B_Low) {
+        ext->FifoD2B_Low  = open_fifo(FIFO_D2B_LOW_PATH,  FILE_WRITE_DATA);
+        if (ext->FifoD2B_Low) drv_log("FIFO d2b_low opened");
     }
 
     Irp->IoStatus.Status = STATUS_SUCCESS;
@@ -1269,7 +1327,7 @@ static NTSTATUS NTAPI DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     ULONG length = irpSp->Parameters.Write.Length;
     IO_STATUS_BLOCK iosb;
 
-    if (!ext->FifoD2B || length == 0) {
+    if ((!ext->FifoD2B_High && !ext->FifoD2B_Low) || length == 0) {
         Irp->IoStatus.Status = STATUS_SUCCESS;
         Irp->IoStatus.Information = length;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -1333,12 +1391,22 @@ static NTSTATUS NTAPI DispatchWrite(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
         }
 
-        /* Write [u16 len][frame] to FIFO for tap_bridge */
+        /* Write [u16 len][frame] atomically in a single write so the bridge
+         * always sees a complete unit or nothing (no partial-length race).
+         * Combined size: 2 + frameLen < PIPE_BUF (4096) → kernel guarantees
+         * atomicity. */
         USHORT fifoLen = (USHORT)frameLen;
-        ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
-                    &fifoLen, sizeof(fifoLen), NULL, NULL);
-        ZwWriteFile(ext->FifoD2B, NULL, NULL, NULL, &iosb,
-                    inBuf + offset, frameLen, NULL, NULL);
+        HANDLE fifo = classify_high_priority(inBuf + offset, (USHORT)frameLen)
+                       ? ext->FifoD2B_High
+                       : ext->FifoD2B_Low;
+        if (fifo) {
+            UCHAR combined[2 + RX_FRAME_MAX];
+            combined[0] = (UCHAR)(fifoLen & 0xFF);
+            combined[1] = (UCHAR)(fifoLen >> 8);
+            RtlCopyMemory(combined + 2, inBuf + offset, frameLen);
+            ZwWriteFile(fifo, NULL, NULL, NULL, &iosb,
+                        combined, 2 + frameLen, NULL, NULL);
+        }
 
         offset += frameLen;
         frameCount++;
@@ -1390,8 +1458,10 @@ static VOID NTAPI Unload(PDRIVER_OBJECT DriverObject)
 
     if (DriverObject->DeviceObject) {
         PDEVICE_EXTENSION ext = (PDEVICE_EXTENSION)DriverObject->DeviceObject->DeviceExtension;
-        if (ext->FifoB2D) ZwClose(ext->FifoB2D);
-        if (ext->FifoD2B) ZwClose(ext->FifoD2B);
+        if (ext->FifoB2D)     ZwClose(ext->FifoB2D);
+        if (ext->FifoD2B)     ZwClose(ext->FifoD2B);
+        if (ext->FifoD2B_High) ZwClose(ext->FifoD2B_High);
+        if (ext->FifoD2B_Low)  ZwClose(ext->FifoD2B_Low);
         IoDeleteDevice(DriverObject->DeviceObject);
     }
 

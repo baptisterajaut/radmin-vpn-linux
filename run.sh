@@ -253,14 +253,14 @@ sudo ip maddr add 224.0.2.60 dev "$TAP_DEV" 2>/dev/null || true
 sudo nmcli device set "$TAP_DEV" managed no 2>/dev/null || true
 
 pkill -f tap_bridge 2>/dev/null || true
-rm -f /tmp/rvpn_b2d /tmp/rvpn_d2b
+rm -f /tmp/rvpn_b2d /tmp/rvpn_d2b /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low
 "$BUILD_DIR/tap_bridge" > /tmp/radmin_bridge.log 2>&1 &
 BRIDGE_PID=$!
 for _ in $(seq 1 10); do
-    [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b ] && break
+    [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b_low ] && break
     sleep 0.1
 done
-if [ ! -p /tmp/rvpn_b2d ] || [ ! -p /tmp/rvpn_d2b ]; then
+if [ ! -p /tmp/rvpn_b2d ] || [ ! -p /tmp/rvpn_d2b_low ]; then
     echo "Erro: falha ao iniciar ponte"
     exit 1
 fi
