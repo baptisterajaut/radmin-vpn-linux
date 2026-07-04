@@ -42,7 +42,7 @@ cleanup() {
     [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null || true
     [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
     sudo ip link delete "$TAP_DEV" 2>/dev/null || true
-    rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b /tmp/rvpn_mac /tmp/rvpn_filters.json
+    rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac /tmp/rvpn_filters.json
     echo "[*] Done"
 }
 trap cleanup EXIT
@@ -149,14 +149,14 @@ echo "[+] TAP $TAP_DEV created (MAC=$ADAPTER_MAC)"
 echo "[*] Starting tap_bridge..."
 pkill -f tap_bridge 2>/dev/null || true
 sleep 0.3
-rm -f /tmp/rvpn_b2d /tmp/rvpn_d2b
-"$BUILD_DIR/tap_bridge" > /tmp/radmin_bridge.log 2>&1 &
-BRIDGE_PID=$!
-for _ in $(seq 1 10); do
-    [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b ] && break
-    sleep 0.2
-done
-if [ ! -p /tmp/rvpn_b2d ] || [ ! -p /tmp/rvpn_d2b ]; then
+    rm -f /tmp/rvpn_b2d /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low
+    "$BUILD_DIR/tap_bridge" > /tmp/radmin_bridge.log 2>&1 &
+    BRIDGE_PID=$!
+    for _ in $(seq 1 10); do
+        [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b_high ] && [ -p /tmp/rvpn_d2b_low ] && break
+        sleep 0.2
+    done
+    if [ ! -p /tmp/rvpn_b2d ] || [ ! -p /tmp/rvpn_d2b_high ] || [ ! -p /tmp/rvpn_d2b_low ]; then
     echo "[-] tap_bridge failed to create FIFOs"
     exit 1
 fi
