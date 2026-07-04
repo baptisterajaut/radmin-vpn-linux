@@ -324,7 +324,7 @@ if [ "$RVPN_DEBUG" = "1" ]; then
     wine reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug" /v Debugger /t REG_SZ /d "winedbg --auto %ld %ld" /f >/dev/null 2>&1 || true
     # Force GUI under winedbg so RvRvpnGui faults dump a full symbolized bt.
     RVPN_GUI_WINEDBG=1
-    echo "[*] RVPN_DEBUG=1 — máximo logging ativo (service+GUI crash capture + bundle no exit)"
+    echo "[*] RVPN_DEBUG=1 — maximum logging active (service+GUI crash capture + bundle no exit)"
 fi
 
 # Force native netsh.exe: wine-staging 11.x prefers its builtin stub even when a
@@ -382,7 +382,7 @@ sudo ip route replace 26.0.0.0/8 dev "$TAP_DEV"
 if [ "$NO_BCAST_ROUTES" = "0" ]; then
     sudo ip route append 255.255.255.255/32 dev "$TAP_DEV" metric 0 2>/dev/null || true
     sudo ip route append 224.0.0.0/4        dev "$TAP_DEV" metric 0 2>/dev/null || true
-    echo "[+] Rotas: broadcast + multicast IPv4 → $TAP_DEV (use --no-broadcast-routes para desativar)"
+    echo "[+] Routes: broadcast + multicast IPv4 → $TAP_DEV (use --no-broadcast-routes to disable)"
 fi
 
 # Patch Qt's qwindows.dll to survive malformed font name-table offsets that Wine
