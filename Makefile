@@ -74,7 +74,7 @@ post-build: $(BINS)
 	$(STRIP32) $(STRIP_FLAGS) $(BUILD)/netsh.exe
 	$(STRIP64) $(STRIP_FLAGS) $(BUILD)/netsh64.exe
 	$(STRIP32) $(STRIP_FLAGS) $(BUILD)/drvinst.exe
-	# UPX nos PEs (ótimo em EXE/DLL, menos eficaz em .sys)
+	# UPX on the PEs (great on EXE/DLL, less effective on .sys)
 	upx --best $(BUILD)/rvpn_launcher.exe $(BUILD)/netsh.exe $(BUILD)/netsh64.exe $(BUILD)/adapter_hook.dll $(BUILD)/drvinst.exe || true
 	upx --best $(BUILD)/tap_bridge || true
 
