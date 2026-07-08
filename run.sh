@@ -8,6 +8,9 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Shared diagnostics/health library (colors, check_*, dump_diagnostics).
+source "$DIR/lib.sh"
+
 # ── Portability helpers ───────────────────────────────────────────────────────
 
 _distro() {
@@ -20,11 +23,11 @@ _distro() {
 
 _wine_install_hint() {
     case "$(_distro)" in
-        fedora)  echo "  sudo dnf install wine winetricks  # ou adicione o repo WineHQ para versão mais recente" ;;
+        fedora)  echo "  sudo dnf install wine winetricks  # or add the WineHQ repo for a newer version" ;;
         debian)  echo "  sudo apt install wine winetricks" ;;
         arch)    echo "  sudo pacman -S wine winetricks" ;;
         suse)    echo "  sudo zypper install wine winetricks" ;;
-        *)       echo "  Instale wine em: https://www.winehq.org/" ;;
+        *)       echo "  Install wine from: https://www.winehq.org/" ;;
     esac
 }
 
@@ -94,7 +97,7 @@ if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
     mkdir -p "$DOWNLOAD_DIR"
     INSTALLER="$DOWNLOAD_DIR/Radmin_VPN_2.0.4899.9.exe"
     if [ ! -f "$INSTALLER" ]; then
-        _http_get "$INSTALLER" "$INSTALLER_URL" || { echo "Erro: download falhou (instale curl ou wget)"; exit 1; }
+        _http_get "$INSTALLER" "$INSTALLER_URL" || { echo "Error: download failed (install curl or wget)"; exit 1; }
     fi
 fi
 
@@ -141,12 +144,12 @@ command -v wineserver >/dev/null || _missing="$_missing wineserver"
 command -v python3    >/dev/null || _missing="$_missing python3"
 command -v ip         >/dev/null || _missing="$_missing ip(iproute2)"
 if [ -n "$_missing" ]; then
-    echo "Erro: dependências ausentes:$_missing"
+    echo "Error: missing dependencies:$_missing"
     _wine_install_hint
     exit 1
 fi
 if [ -z "${RADMIN_SUDO_PRIMED:-}" ]; then
-    sudo -v || { echo "Erro: permissão insuficiente (sudo necessário para dispositivo TAP)"; exit 1; }
+    sudo -v || { echo "Error: insufficient permissions (sudo required for the TAP device)"; exit 1; }
 fi
 
 # Wine version gate: requires >= 11.0 for overlapped I/O semantics.
@@ -155,7 +158,7 @@ WINE_MAJOR=$(wine_major || echo 0)
 if [ -n "${APPIMAGE:-}" ]; then
     echo "[*] Wine bundled: $WINE_VERSION_STR"
 elif ! [ "${WINE_MAJOR:-0}" -ge 11 ] 2>/dev/null; then
-    echo "[-] Wine $WINE_VERSION_STR muito antigo — requer Wine >= 11.0."
+    echo "[-] Wine $WINE_VERSION_STR too old — requires Wine >= 11.0."
     echo "    Atualize wine-staging ou use o AppImage com Wine 11.x embutido."
     _wine_install_hint
     exit 1
@@ -181,7 +184,7 @@ wineserver -p 2>/dev/null || true
 # 2. Install Radmin if not present
 if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
     if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
-        echo "Erro: instalador não encontrado"
+        echo "Error: installer not found"
         exit 1
     fi
     mkdir -p "$WINEPREFIX"
@@ -196,7 +199,7 @@ if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
         [ -f "$RADMIN/RvControlSvc.exe" ] && break
     done
     if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
-        echo "Erro: instalação falhou"
+        echo "Error: installation failed"
         exit 1
     fi
     wineserver -k 2>/dev/null || true
@@ -261,7 +264,7 @@ for _ in $(seq 1 10); do
     sleep 0.1
 done
 if [ ! -p /tmp/rvpn_b2d ] || [ ! -p /tmp/rvpn_d2b_low ]; then
-    echo "Erro: falha ao iniciar ponte"
+    echo "Error: failed to start bridge"
     exit 1
 fi
 
@@ -344,6 +347,7 @@ _svc_winedebug="-all"
 [ "$RVPN_DEBUG" = "1" ] && _svc_winedebug="+seh,+tid,+pid"
 WINEDEBUG="$_svc_winedebug" WINE_LARGE_ADDRESS_AWARE=1 wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 
+SERVICE_START=$(date +%s)
 for _ in $(seq 1 60); do
     sleep 0.5
     if [ -f "$LOG" ]; then
@@ -353,7 +357,7 @@ for _ in $(seq 1 60); do
         if printf '%s' "$log_txt" | grep -qE 'Service version: *1\.4'; then
             ver=$(printf '%s' "$log_txt" | grep -oE 'Service version: *[0-9.]+' | head -n1)
             echo ""
-            echo "[-] Versão não suportada ($ver). Use Radmin VPN 2.0.x."
+            echo "[-] Unsupported version ($ver). Use Radmin VPN 2.0.x."
             echo "    rm -rf \"$WINEPREFIX\" && ./run.sh --installer /path/to/Radmin_VPN_2.0.*.exe"
             exit 1
         fi
@@ -371,8 +375,18 @@ if has_ready:
             break
         fi
     fi
-    pgrep -f RvControlSvc >/dev/null || { echo "Erro: serviço encerrado"; exit 1; }
+    pgrep -f RvControlSvc >/dev/null || {
+        dump_diagnostics "Service started then died (waited $(( $(date +%s) - SERVICE_START ))s)"
+        echo "Error: service exited"
+        exit 1
+    }
 done
+
+if [ -z "${vpn_ip:-}" ]; then
+    dump_diagnostics "Service alive but never became ready (timed out after $(( $(date +%s) - SERVICE_START ))s)"
+    echo "[-] Service never reported ready — see diagnostics above."
+    exit 1
+fi
 
 if [ -n "$vpn_ip" ]; then
     sudo ip addr add "$vpn_ip/8" dev "$TAP_DEV" 2>/dev/null || true

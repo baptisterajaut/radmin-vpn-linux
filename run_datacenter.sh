@@ -7,6 +7,9 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Shared diagnostics/health library (colors, check_*, dump_diagnostics).
+source "$DIR/lib.sh"
+
 _distro() {
     if command -v dnf      >/dev/null 2>&1; then printf 'fedora'
     elif command -v apt-get >/dev/null 2>&1; then printf 'debian'
@@ -396,6 +399,7 @@ wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 
 # ── 14. Wait for service ready + extract VPN IP ──
 echo "[*] Waiting for service ready..."
+SERVICE_START=$(date +%s)
 for _ in $(seq 1 60); do
     sleep 1
     if [ -f "$LOG" ]; then
@@ -416,8 +420,18 @@ if has_ready:
             break
         fi
     fi
-    pgrep -f RvControlSvc >/dev/null || { echo "[-] Service died"; exit 1; }
+    pgrep -f RvControlSvc >/dev/null || {
+        dump_diagnostics "Service started then died (waited $(( $(date +%s) - SERVICE_START ))s)"
+        echo "[-] Service died"
+        exit 1
+    }
 done
+
+if [ -z "${vpn_ip:-}" ]; then
+    dump_diagnostics "Service alive but never became ready (timed out after $(( $(date +%s) - SERVICE_START ))s)"
+    echo "[-] Service never reported ready — see diagnostics above."
+    exit 1
+fi
 
 # ── 15. Assign VPN IP to TAP device + set up route ──
 sleep 2
