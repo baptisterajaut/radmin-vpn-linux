@@ -111,6 +111,10 @@ fi
 cp "$ROOT/run.sh" "$APPDIR/usr/bin/run.sh"
 chmod +x "$APPDIR/usr/bin/run.sh"
 
+# lib.sh — run.sh does `source "$DIR/lib.sh"` (with set -u), so it must sit
+# right next to run.sh in the AppDir or the launcher dies on line 12.
+cp "$ROOT/lib.sh" "$APPDIR/usr/bin/lib.sh"
+
 # patch_qwindows_font.py — run.sh's --fix-chat looks for it next to itself
 # ($DIR/patch_qwindows_font.py). Without this it silently no-ops in the AppImage.
 cp "$ROOT/patch_qwindows_font.py" "$APPDIR/usr/bin/patch_qwindows_font.py"
