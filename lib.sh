@@ -152,9 +152,9 @@ dump_diagnostics() {
 
     echo "--- Outbound connections (service → Famatech) ---"
     if command -v ss >/dev/null 2>&1; then
-        ss -tanp 2>/dev/null | grep -iE 'wine|radmin' | sed 's/^/  /' || true
+        ss -tanp 2>/dev/null | grep -iE 'wine|radmin|RvControlSvc|\.exe' | sed 's/^/  /' || true
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -tanp 2>/dev/null | grep -iE 'wine|radmin' | sed 's/^/  /' || true
+        netstat -tanp 2>/dev/null | grep -iE 'wine|radmin|RvControlSvc|\.exe' | sed 's/^/  /' || true
     else
         echo "  (neither ss nor netstat available)"
     fi
