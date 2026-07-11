@@ -16,11 +16,14 @@
  */
 
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 #define TAP_DESC     L"radminvpn0"
 #define RADMIN_DESC  L"Famatech Radmin VPN Ethernet Adapter"
@@ -450,6 +453,197 @@ static ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO Info, PULONG Size)
     return ret;
 }
 
+/* ====== Candidate-source filtering: gethostbyname / getaddrinfo (issue #16) ======
+ *
+ * GAA/GAI are only TWO of the three local-address sources the ROL connector
+ * feeds into its NAT-traversal candidate set. The third is
+ * gethostbyname(gethostname()) (and, defensively, getaddrinfo of the local
+ * name): on systemd hosts nss-myhostname resolves the local hostname to EVERY
+ * locally-configured IP, so docker0/vmnet/tailscale/dummy addresses leak in
+ * proportional to the interface count — which is why rc5 (GAA/GAI only) still
+ * hung with docker+tailscale up. RvROLClient imports gethostbyname by ORDINAL
+ * (WS2_32 #52), which is why the name-based IAT hook never reached it.
+ *
+ * Policy (single best uplink + TAP, IPv4-only). We compute the set of IPv4
+ * addresses owned by the default-route interface + our TAP, then keep only
+ * those in the results of the local-hostname lookup. Every ambiguity biases to
+ * PASSTHROUGH: over-filtering (hiding the only path) is a regression, while
+ * under-filtering is just the leaky status quo. */
+
+#define WS2_ORD_GETHOSTBYNAME 52          /* WS2_32.dll ordinal (verified) */
+#define ALLOWED_MAX           32
+
+static DWORD g_allowed_v4[ALLOWED_MAX];   /* in_addr.s_addr, network byte order */
+static int   g_allowed_n     = 0;
+static BOOL  g_allowed_valid = FALSE;
+
+static struct hostent *(WINAPI *real_gethostbyname)(const char *) = NULL;
+static int (WINAPI *real_getaddrinfo)(const char *, const char *,
+    const struct addrinfo *, struct addrinfo **) = NULL;
+
+/* 100.64.0.0/10 — CGNAT range used by Tailscale et al. */
+static BOOL is_cgnat(DWORD s_addr_net)
+{
+    return (ntohl(s_addr_net) & 0xFFC00000u) == 0x64400000u;
+}
+
+static BOOL in_allowed_v4(DWORD s_addr_net)
+{
+    for (int i = 0; i < g_allowed_n; i++)
+        if (g_allowed_v4[i] == s_addr_net) return TRUE;
+    return FALSE;
+}
+
+/* Rebuild g_allowed_v4 = IPv4 of {default-route iface, TAP}. Recomputed per hook
+ * entry (cheap; keeps up with tailscale-up-mid-session). Any uncertainty leaves
+ * g_allowed_valid = FALSE so every caller passes through untouched.
+ * Bails: no real GAA yet, no default route, uplink not enumerated, uplink has no
+ * IPv4, or the uplink's IPv4 is CGNAT (overlay hijacked the default route —
+ * refuse to commit to an unreachable path). Uses the REAL GAA (no recursion). */
+static void build_allowed_v4(void)
+{
+    g_allowed_valid = FALSE;
+    g_allowed_n = 0;
+
+    if (!real_GetAdaptersAddresses) return;
+    DWORD uplink = default_route_ifindex();
+    if (!uplink) return;
+
+    ULONG size = 15 * 1024;
+    IP_ADAPTER_ADDRESSES *buf = (IP_ADAPTER_ADDRESSES *)malloc(size);
+    if (!buf) return;
+    ULONG r = real_GetAdaptersAddresses(AF_INET, 0, NULL, buf, &size);
+    if (r == ERROR_BUFFER_OVERFLOW) {
+        IP_ADAPTER_ADDRESSES *nb = (IP_ADAPTER_ADDRESSES *)realloc(buf, size);
+        if (!nb) { free(buf); return; }
+        buf = nb;
+        r = real_GetAdaptersAddresses(AF_INET, 0, NULL, buf, &size);
+    }
+    if (r != ERROR_SUCCESS) { free(buf); return; }
+
+    BOOL uplink_has_v4 = FALSE;
+    for (IP_ADAPTER_ADDRESSES *a = buf; a; a = a->Next) {
+        if (a->IfIndex != uplink && a->IfIndex != g_tap_ifindex) continue;
+        for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (!u->Address.lpSockaddr ||
+                u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            DWORD ip = ((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr;
+            if (a->IfIndex == uplink) {
+                uplink_has_v4 = TRUE;
+                if (is_cgnat(ip)) { free(buf); return; }   /* overlay-as-default */
+            }
+            if (g_allowed_n < ALLOWED_MAX) g_allowed_v4[g_allowed_n++] = ip;
+        }
+    }
+    free(buf);
+    if (!uplink_has_v4) return;
+    g_allowed_valid = TRUE;
+}
+
+/* lowercase + strip trailing dots into a bounded buffer */
+static void norm_host(char *dst, size_t dstsz, const char *src)
+{
+    size_t i = 0;
+    for (; src[i] && i + 1 < dstsz; i++)
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    while (i && dst[i - 1] == '.') i--;
+    dst[i] = 0;
+}
+
+/* TRUE iff `name` refers to this host (so filtering it is safe). The gatherer
+ * obtains the name from gethostname(), so we match that string (case-insensitive,
+ * full and short forms). Server names (proxy.radminte.com, …) never match and
+ * pass through untouched. gethostname() here is the real, unhooked ws2_32 one. */
+static BOOL is_local_hostname(const char *name)
+{
+    if (!name || !*name) return FALSE;
+    char host[256];
+    if (gethostname(host, sizeof host) != 0) return FALSE;
+    char a[256], b[256];
+    norm_host(a, sizeof a, name);
+    norm_host(b, sizeof b, host);
+    if (_stricmp(a, b) == 0) return TRUE;
+    char *da = strchr(a, '.'); if (da) *da = 0;    /* compare short forms too */
+    char *db = strchr(b, '.'); if (db) *db = 0;
+    return _stricmp(a, b) == 0;
+}
+
+static struct hostent *WINAPI hook_gethostbyname(const char *name)
+{
+    struct hostent *h = real_gethostbyname ? real_gethostbyname(name) : NULL;
+    if (!h || h->h_addrtype != AF_INET || !h->h_addr_list) return h;
+    if (!is_local_hostname(name)) return h;         /* protects server lookups */
+    build_allowed_v4();
+    if (!g_allowed_valid) return h;
+
+    /* Count survivors first: if none would remain, pass through untouched rather
+     * than hand back an empty list (a naive caller derefs h_addr_list[0]). */
+    int keep = 0;
+    for (char **rd = h->h_addr_list; *rd; rd++)
+        if (in_allowed_v4(*(DWORD *)*rd)) keep++;
+    if (keep == 0) return h;
+
+    char **rd = h->h_addr_list, **wr = h->h_addr_list;
+    int dropped = 0;
+    for (; *rd; rd++) {
+        if (in_allowed_v4(*(DWORD *)*rd)) *wr++ = *rd;
+        else dropped++;
+    }
+    *wr = NULL;
+    if (dropped) {
+        char b[96];
+        snprintf(b, sizeof b, "filter(gethostbyname): kept %d, dropped %d local addr(s)",
+                 keep, dropped);
+        dbg(b);
+    }
+    return h;
+}
+
+static int WINAPI hook_getaddrinfo(const char *node, const char *service,
+    const struct addrinfo *hints, struct addrinfo **res)
+{
+    int rc = real_getaddrinfo ? real_getaddrinfo(node, service, hints, res)
+                              : EAI_FAIL;
+    if (rc != 0 || !res || !*res) return rc;
+    if (!is_local_hostname(node)) return rc;        /* protects server lookups */
+    build_allowed_v4();
+    if (!g_allowed_valid) return rc;
+
+    /* Count allowed AF_INET survivors; if none, pass through (never return
+     * success with *res == NULL — the getaddrinfo contract callers rely on). */
+    int keep = 0;
+    for (struct addrinfo *c = *res; c; c = c->ai_next)
+        if (c->ai_family == AF_INET && c->ai_addr &&
+            in_allowed_v4(((struct sockaddr_in *)c->ai_addr)->sin_addr.s_addr))
+            keep++;
+    if (keep == 0) return rc;
+
+    /* Unlink non-AF_INET (v6) and non-allowed v4. Dropped nodes are detached and
+     * leaked — bounded (a few local-hostname lookups per session). CBA. */
+    struct addrinfo *cur = *res, *prev = NULL;
+    int dropped = 0;
+    while (cur) {
+        BOOL ok = (cur->ai_family == AF_INET && cur->ai_addr &&
+                   in_allowed_v4(((struct sockaddr_in *)cur->ai_addr)->sin_addr.s_addr));
+        struct addrinfo *next = cur->ai_next;
+        if (ok) {
+            prev = cur;
+        } else {
+            if (prev) prev->ai_next = next; else *res = next;
+            cur->ai_next = NULL;                     /* detach (leaked) */
+            dropped++;
+        }
+        cur = next;
+    }
+    if (dropped) {
+        char b[96];
+        snprintf(b, sizeof b, "filter(getaddrinfo): kept %d, dropped %d local addr(s)",
+                 keep, dropped);
+        dbg(b);
+    }
+    return rc;
+}
+
 /* ====== RegSetKeySecurity hook ======
  *
  * Radmin calls RegSetKeySecurity on the Registration subkey with a DACL
@@ -471,8 +665,10 @@ static LONG WINAPI hook_RegSetKeySecurity(HKEY hKey, SECURITY_INFORMATION si,
 /* ====== IAT patching ====== */
 
 /* Replace mod's IAT entry for dll!fn with newfn, saving the original into *saved.
- * Returns TRUE if the import was found and patched. */
-static BOOL hook_import(HMODULE mod, const char *dll, const char *fn,
+ * Match by name when fn != NULL, else by ordinal `ord` (needed for functions a
+ * module imports by ordinal — e.g. WS2_32 gethostbyname is ordinal 52, and the
+ * name path can never see it). Returns TRUE if the import was found and patched. */
+static BOOL hook_import(HMODULE mod, const char *dll, const char *fn, WORD ord,
                         void *newfn, void **saved)
 {
     if (!mod) return FALSE;
@@ -490,10 +686,18 @@ static BOOL hook_import(HMODULE mod, const char *dll, const char *fn,
         PIMAGE_THUNK_DATA orig  = (PIMAGE_THUNK_DATA)((BYTE *)mod + imp->OriginalFirstThunk);
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE *)mod + imp->FirstThunk);
         for (; orig->u1.AddressOfData; orig++, thunk++) {
-            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
-            PIMAGE_IMPORT_BY_NAME bn =
-                (PIMAGE_IMPORT_BY_NAME)((BYTE *)mod + orig->u1.AddressOfData);
-            if (strcmp(bn->Name, fn) != 0) continue;
+            BOOL match;
+            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) {
+                /* imported by ordinal — only matchable when caller asked for one */
+                match = (fn == NULL) &&
+                        (IMAGE_ORDINAL(orig->u1.Ordinal) == ord);
+            } else {
+                if (fn == NULL) continue;
+                PIMAGE_IMPORT_BY_NAME bn =
+                    (PIMAGE_IMPORT_BY_NAME)((BYTE *)mod + orig->u1.AddressOfData);
+                match = (strcmp(bn->Name, fn) == 0);
+            }
+            if (!match) continue;
             if (saved) *saved = (void *)thunk->u1.Function;
             DWORD old;
             if (!VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), PAGE_READWRITE, &old))
@@ -512,13 +716,29 @@ static BOOL hook_import(HMODULE mod, const char *dll, const char *fn,
 static void hook_iphlpapi(HMODULE mod, const char *tag)
 {
     char buf[64];
-    if (hook_import(mod, "IPHLPAPI.DLL", "GetAdaptersAddresses",
+    if (hook_import(mod, "IPHLPAPI.DLL", "GetAdaptersAddresses", 0,
                     hook_GetAdaptersAddresses, (void **)&real_GetAdaptersAddresses)) {
         snprintf(buf, sizeof(buf), "hooked GetAdaptersAddresses (%s)", tag); dbg(buf);
     }
-    if (hook_import(mod, "IPHLPAPI.DLL", "GetAdaptersInfo",
+    if (hook_import(mod, "IPHLPAPI.DLL", "GetAdaptersInfo", 0,
                     hook_GetAdaptersInfo, (void **)&real_GetAdaptersInfo)) {
         snprintf(buf, sizeof(buf), "hooked GetAdaptersInfo (%s)", tag); dbg(buf);
+    }
+}
+
+/* Hook the ws2_32 local-address sources in a module: gethostbyname (imported by
+ * ORDINAL 52) and getaddrinfo (imported by name). Shared real_* globals, same as
+ * the iphlpapi pair. */
+static void hook_ws2_32(HMODULE mod, const char *tag)
+{
+    char buf[64];
+    if (hook_import(mod, "WS2_32.DLL", NULL, WS2_ORD_GETHOSTBYNAME,
+                    hook_gethostbyname, (void **)&real_gethostbyname)) {
+        snprintf(buf, sizeof(buf), "hooked gethostbyname (ord 52) (%s)", tag); dbg(buf);
+    }
+    if (hook_import(mod, "WS2_32.DLL", "getaddrinfo", 0,
+                    hook_getaddrinfo, (void **)&real_getaddrinfo)) {
+        snprintf(buf, sizeof(buf), "hooked getaddrinfo (%s)", tag); dbg(buf);
     }
 }
 
@@ -533,6 +753,7 @@ static void try_patch_rol(void)
     if (!rol) return;
     if (InterlockedExchange(&g_rol_patched, 1) != 0) return;   /* patch once */
     hook_iphlpapi(rol, "RvROLClient.dll");
+    hook_ws2_32(rol, "RvROLClient.dll");
     dbg("RvROLClient.dll IAT patched");
 }
 
@@ -606,13 +827,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         /* EXE: iphlpapi enumerators (rename + filter), RegSetKeySecurity no-op,
          * and LoadLibrary hooks to catch RvROLClient.dll's dynamic load. */
         hook_iphlpapi(exe, "RvControlSvc.exe");
-        hook_import(exe, "ADVAPI32.DLL", "RegSetKeySecurity",
+        hook_ws2_32(exe, "RvControlSvc.exe");
+        hook_import(exe, "ADVAPI32.DLL", "RegSetKeySecurity", 0,
                     hook_RegSetKeySecurity,  (void **)&real_RegSetKeySecurity);
-        hook_import(exe, "KERNEL32.dll", "LoadLibraryW",
+        hook_import(exe, "KERNEL32.dll", "LoadLibraryW", 0,
                     hook_LoadLibraryW,       (void **)&real_LoadLibraryW);
-        hook_import(exe, "KERNEL32.dll", "LoadLibraryA",
+        hook_import(exe, "KERNEL32.dll", "LoadLibraryA", 0,
                     hook_LoadLibraryA,       (void **)&real_LoadLibraryA);
-        hook_import(exe, "KERNEL32.dll", "LoadLibraryExW",
+        hook_import(exe, "KERNEL32.dll", "LoadLibraryExW", 0,
                     hook_LoadLibraryExW,     (void **)&real_LoadLibraryExW);
 
         /* RvROLClient.dll may already be resident; otherwise the LoadLibrary hooks
