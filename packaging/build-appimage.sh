@@ -51,9 +51,10 @@ if [ ! -d "$WINE_DIR" ] || [ -L "$WINE_DIR" ]; then
     releases_json=$(curl -fsSL "${gh_auth[@]}" \
         'https://api.github.com/repos/Kron4ek/Wine-Builds/releases?per_page=20') \
         || { echo "[-] GitHub API request failed (rate limited?)"; exit 1; }
-    WINE_URL=$(printf '%s' "$releases_json" \
-        | grep -m1 -oE '"browser_download_url": *"[^"]*staging-amd64-wow64\.tar\.xz"' \
-        | sed 's/.*"\(https[^"]*\)"/\1/')
+    # here-string, not `printf | grep`: grep -m1 exits after the first match and
+    # would SIGPIPE an upstream printf (broken pipe → pipefail abort).
+    WINE_URL=$(grep -m1 -oE '"browser_download_url": *"[^"]*staging-amd64-wow64\.tar\.xz"' \
+        <<<"$releases_json" | sed 's/.*"\(https[^"]*\)"/\1/')
     [ -n "$WINE_URL" ] || { echo "[-] Could not resolve Kron4ek wine URL"; exit 1; }
     echo "[*] Downloading $WINE_URL"
     curl -fL -o wine.tar.xz "$WINE_URL"
