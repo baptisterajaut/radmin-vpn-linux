@@ -31,9 +31,6 @@ _wine_install_hint() {
     esac
 }
 
-wine_version_str() { wine --version 2>/dev/null | head -n1; }
-wine_major() { wine_version_str | sed -n 's/^wine-\([0-9]\+\).*/\1/p'; }
-
 _http_get() {
     local dest="$1" url="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -97,7 +94,7 @@ if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
     mkdir -p "$DOWNLOAD_DIR"
     INSTALLER="$DOWNLOAD_DIR/Radmin_VPN_2.0.4899.9.exe"
     if [ ! -f "$INSTALLER" ]; then
-        _http_get "$INSTALLER" "$INSTALLER_URL" || { echo "Error: download failed (install curl or wget)"; exit 1; }
+        _http_get "$INSTALLER" "$INSTALLER_URL" || die "download failed (install curl or wget)"
     fi
 fi
 
@@ -126,16 +123,16 @@ cleanup() {
         } > "$BUND/net_state.txt" 2>&1 || true
         { dmesg 2>/dev/null || sudo dmesg 2>/dev/null; } | tail -150 > "$BUND/dmesg_tail.txt" 2>/dev/null || true
         echo ""
-        echo "[*] Debug bundle salvo em: $BUND"
+        say "Debug bundle saved to: $BUND"
         if [ -s "$WINEPREFIX/drive_c/radmin_crash.log" ]; then
-            echo "[!] CRASH capturado — resumo:"
+            warn "CRASH captured — summary:"
             grep -E 'CRASH|code=0x|access-violation|  #0[0-3] ' "$WINEPREFIX/drive_c/radmin_crash.log" | tail -12
         fi
     fi
 }
 trap cleanup EXIT
 
-echo "Radmin VPN - starting service..."
+say "Radmin VPN for Linux"
 
 # Prerequisites
 _missing=""
@@ -144,29 +141,31 @@ command -v wineserver >/dev/null || _missing="$_missing wineserver"
 command -v python3    >/dev/null || _missing="$_missing python3"
 command -v ip         >/dev/null || _missing="$_missing ip(iproute2)"
 if [ -n "$_missing" ]; then
-    echo "Error: missing dependencies:$_missing"
+    echo "[-] Missing dependencies:$_missing" >&2
     _wine_install_hint
     exit 1
 fi
 if [ -z "${RADMIN_SUDO_PRIMED:-}" ]; then
-    sudo -v || { echo "Error: insufficient permissions (sudo required for the TAP device)"; exit 1; }
+    sudo -v || die "insufficient permissions (sudo required for the TAP device)"
 fi
 
 # Wine version gate: requires >= 11.0 for overlapped I/O semantics.
 WINE_VERSION_STR=$(wine_version_str || echo '?')
 WINE_MAJOR=$(wine_major || echo 0)
 if [ -n "${APPIMAGE:-}" ]; then
-    echo "[*] Wine bundled: $WINE_VERSION_STR"
+    say "Wine (bundled): $WINE_VERSION_STR"
 elif ! [ "${WINE_MAJOR:-0}" -ge 11 ] 2>/dev/null; then
-    echo "[-] Wine $WINE_VERSION_STR too old — requires Wine >= 11.0."
-    echo "    Atualize wine-staging ou use o AppImage com Wine 11.x embutido."
+    echo "[-] Wine $WINE_VERSION_STR too old — requires Wine >= 11.0." >&2
+    echo "    Update wine-staging, or use the AppImage with Wine 11.x bundled." >&2
     _wine_install_hint
     exit 1
+else
+    say "Wine: $WINE_VERSION_STR"
 fi
 
 # Warn about SELinux (Fedora/RHEL) — can silently block tap_bridge and Wine pipes
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
-    echo "Aviso: SELinux Enforcing detectado. Em caso de falha, tente:"
+    warn "SELinux Enforcing detected. If startup fails, try:"
     echo "  sudo setsebool -P allow_execmod on"
     echo "  sudo chcon -t bin_t \"$BUILD_DIR/tap_bridge\""
 fi
@@ -184,31 +183,34 @@ wineserver -p 2>/dev/null || true
 # 2. Install Radmin if not present
 if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
     if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
-        echo "Error: installer not found"
-        exit 1
+        die "installer not found"
     fi
+    say "Installing Radmin VPN (first run — this takes a moment)..."
     mkdir -p "$WINEPREFIX"
     wineboot --init 2>/dev/null
     if command -v winetricks >/dev/null 2>&1; then
         winetricks -q d3dcompiler_47 d3dx11_43 dxvk 2>/dev/null || true
     fi
     wineserver -k 2>/dev/null || true
+    say "Running installer..."
     wine "$INSTALLER" /VERYSILENT /NORESTART 2>/dev/null || true
+    say "Waiting for installer to finish..."
     for _ in $(seq 1 30); do
         sleep 0.5
         [ -f "$RADMIN/RvControlSvc.exe" ] && break
     done
     if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
-        echo "Error: installation failed"
-        exit 1
+        die "installation failed"
     fi
     wineserver -k 2>/dev/null || true
     wine reg delete "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvNetMP60" /f > /dev/null 2>&1 || true
     rm -f "$WINEPREFIX/drive_c/windows/system32/drivers/RvNetMP60.sys"
     wine reg add "HKLM\\SYSTEM\\CurrentControlSet\\Services\\RvControlSvc" /v Start /t REG_DWORD /d 4 /f > /dev/null 2>&1 || true
     wineserver -k 2>/dev/null || true
+    good "Radmin VPN installed"
 fi
 
+say "Installing components..."
 chmod +x "$BUILD_DIR/tap_bridge" 2>/dev/null || true
 cp "$BUILD_DIR/rvpnnetmp.sys" "$WINEPREFIX/drive_c/windows/system32/drivers/"
 cp "$BUILD_DIR/adapter_hook.dll" "$RADMIN/"
@@ -232,10 +234,12 @@ else
     ADAPTER_MAC=$(printf '02:%02x:%02x:%02x:%02x:%02x' \
         $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
     echo "$ADAPTER_MAC" > "$MAC_FILE"
+    good "Generated adapter MAC: $ADAPTER_MAC"
 fi
 # Write raw 6 bytes for driver to read
 printf '%b' "$(echo "$ADAPTER_MAC" | sed 's/://g; s/../\\x&/g')" > /tmp/rvpn_mac
 
+say "Creating TAP device..."
 sudo modprobe tun 2>/dev/null || true
 sudo ip link delete "$TAP_DEV" 2>/dev/null || true
 sudo ip tuntap add dev "$TAP_DEV" mode tap user "$(whoami)"
@@ -254,7 +258,9 @@ sudo ip maddr add 224.0.2.60 dev "$TAP_DEV" 2>/dev/null || true
 # each address cycle triggers an NDIS adapter-removal event inside Wine,
 # which causes DispatchCleanup to fire and crash (0xc0000005 in ntdll).
 sudo nmcli device set "$TAP_DEV" managed no 2>/dev/null || true
+good "TAP $TAP_DEV up (MAC=$ADAPTER_MAC)"
 
+say "Starting tap_bridge..."
 pkill -f tap_bridge 2>/dev/null || true
 rm -f /tmp/rvpn_b2d /tmp/rvpn_d2b /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low
 "$BUILD_DIR/tap_bridge" > /tmp/radmin_bridge.log 2>&1 &
@@ -264,16 +270,19 @@ for _ in $(seq 1 10); do
     sleep 0.1
 done
 if [ ! -p /tmp/rvpn_b2d ] || [ ! -p /tmp/rvpn_d2b_low ]; then
-    echo "Error: failed to start bridge"
-    exit 1
+    die "tap_bridge failed to create FIFOs"
 fi
+good "tap_bridge running (pid=$BRIDGE_PID)"
 
+say "Detecting TAP adapter GUID..."
 TAP_GUID=$(timeout 10 wine wmic path Win32_NetworkAdapter get Name,GUID \
     | grep "$TAP_DEV" | awk '{print $1}' | tr -d '\r')
 if [ -z "$TAP_GUID" ]; then
     TAP_GUID="{$(echo "$ADAPTER_MAC" | sed 's/://g' | md5sum | cut -c1-8)-$(echo "$ADAPTER_MAC" | sed 's/://g' | md5sum | cut -c9-12)-4$(echo "$ADAPTER_MAC" | sed 's/://g' | md5sum | cut -c13-16)-$(echo "$ADAPTER_MAC" | sed 's/://g' | md5sum | cut -c17-20)-$(echo "$ADAPTER_MAC" | sed 's/://g' | md5sum | cut -c21-32)}"
 fi
+good "TAP GUID: $TAP_GUID"
 
+say "Configuring registry..."
 {
 wine reg add "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0099" /v NetCfgInstanceId /t REG_SZ /d "$TAP_GUID" /f
 wine reg add "HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\0099" /v MatchingDeviceId /t REG_SZ /d "${TAP_GUID}\\RvNetMP60" /f
@@ -293,6 +302,7 @@ wineserver -k 2>/dev/null || true
 wine reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Memory Management" /v SystemPages /t REG_DWORD /d 0xFFFFFFFF /f > /dev/null 2>&1
 wine reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Memory Management" /v ClearPageFileAtShutdown /t REG_DWORD /d 0 /f > /dev/null 2>&1
 wine reg add "HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\Memory Management" /v LargeSystemCache /t REG_DWORD /d 1 /f > /dev/null 2>&1
+good "Registry configured"
 
 # 8. Start netsh relay
 rm -f "$CMD_FILE" "${CMD_FILE}.proc"
@@ -327,7 +337,7 @@ if [ "$RVPN_DEBUG" = "1" ]; then
     wine reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug" /v Debugger /t REG_SZ /d "winedbg --auto %ld %ld" /f >/dev/null 2>&1 || true
     # Force GUI under winedbg so RvRvpnGui faults dump a full symbolized bt.
     RVPN_GUI_WINEDBG=1
-    echo "[*] RVPN_DEBUG=1 — maximum logging active (service+GUI crash capture + bundle no exit)"
+    say "RVPN_DEBUG=1 — maximum logging active (service+GUI crash capture + bundle on exit)"
 fi
 
 # Force native netsh.exe: wine-staging 11.x prefers its builtin stub even when a
@@ -341,12 +351,14 @@ export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree=;mshtml=};netsh.exe=n"
 # (install_release_guard), injected before RvControlSvc starts. No static patch
 # of RvControlSvc.exe is needed.
 
+say "Starting Radmin VPN service..."
 cd "$RADMIN"
 # Service Wine debug channels: silent by default, +seh backtrace when debugging.
 _svc_winedebug="-all"
 [ "$RVPN_DEBUG" = "1" ] && _svc_winedebug="+seh,+tid,+pid"
 WINEDEBUG="$_svc_winedebug" WINE_LARGE_ADDRESS_AWARE=1 wine rvpn_launcher.exe /run > /tmp/radmin_service.log 2>&1 &
 
+say "Waiting for service to become ready..."
 SERVICE_START=$(date +%s)
 for _ in $(seq 1 60); do
     sleep 0.5
@@ -377,26 +389,26 @@ if has_ready:
     fi
     pgrep -f RvControlSvc >/dev/null || {
         dump_diagnostics "Service started then died (waited $(( $(date +%s) - SERVICE_START ))s)"
-        echo "Error: service exited"
-        exit 1
+        die "service exited"
     }
 done
 
 if [ -z "${vpn_ip:-}" ]; then
     dump_diagnostics "Service alive but never became ready (timed out after $(( $(date +%s) - SERVICE_START ))s)"
-    echo "[-] Service never reported ready — see diagnostics above."
-    exit 1
+    die "Service never reported ready — see diagnostics above."
 fi
+good "Adapter ready — VPN IP: $vpn_ip"
 
 if [ -n "$vpn_ip" ]; then
     sudo ip addr add "$vpn_ip/8" dev "$TAP_DEV" 2>/dev/null || true
     sudo ip link set "$TAP_DEV" up 2>/dev/null || true
 fi
 sudo ip route replace 26.0.0.0/8 dev "$TAP_DEV"
+good "Route: 26.0.0.0/8 → $TAP_DEV"
 if [ "$NO_BCAST_ROUTES" = "0" ]; then
     sudo ip route append 255.255.255.255/32 dev "$TAP_DEV" metric 0 2>/dev/null || true
     sudo ip route append 224.0.0.0/4        dev "$TAP_DEV" metric 0 2>/dev/null || true
-    echo "[+] Routes: broadcast + multicast IPv4 → $TAP_DEV (use --no-broadcast-routes to disable)"
+    good "Routes: broadcast + multicast IPv4 → $TAP_DEV (--no-broadcast-routes to skip)"
 fi
 
 # Patch Qt's qwindows.dll to survive malformed font name-table offsets that Wine
@@ -405,8 +417,8 @@ fi
 if [ "$FIX_CHAT" -eq 1 ]; then
     if [ -f "$DIR/patch_qwindows_font.py" ] && [ -f "$RADMIN/platforms/qwindows.dll" ]; then
         python3 "$DIR/patch_qwindows_font.py" "$RADMIN/platforms/qwindows.dll" >/dev/null 2>&1 \
-            && echo "[+] chat fix applied (qwindows.dll patched)" \
-            || echo "[!] warning: qwindows.dll patch failed — chat may crash"
+            && good "chat fix applied (qwindows.dll patched)" \
+            || warn "qwindows.dll patch failed — chat may crash"
     fi
 fi
 
@@ -430,6 +442,7 @@ fi
 #                          left unset by default now).
 GUI_PID=""
 if [ "$NO_UI" -eq 0 ]; then
+    say "Starting GUI..."
     [ -n "${QT_QUICK_BACKEND:-}" ] && export QT_QUICK_BACKEND
     _gui_winedebug="-all"
     if [ "${RVPN_GUI_DEBUG:-0}" = "1" ]; then
@@ -449,7 +462,7 @@ if [ "$NO_UI" -eq 0 ]; then
     fi
     GUI_PID=$!
 else
-    echo "[*] --no-ui: GUI not launched (service runs headless)"
+    say "--no-ui: GUI not launched (service runs headless)"
 fi
 
 # Packet-filter UI is opt-in via --filter-ui (and never with --no-ui).
@@ -458,7 +471,7 @@ if [ "$FILTER_UI" -eq 1 ] && [ "$NO_UI" -eq 0 ] && [ -x "$BUILD_DIR/rvpn_filter_
     FILTER_UI_PID=$!
 fi
 
-echo "Radmin VPN - service active"
+good "Radmin VPN running — close the GUI or press Ctrl+C to stop."
 
 
 if [ -n "$GUI_PID" ]; then
