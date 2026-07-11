@@ -39,9 +39,21 @@ if [ ! -d "$WINE_DIR" ] || [ -L "$WINE_DIR" ]; then
     rm -rf "$WINE_DIR" "$DIST/wine-extract-work"
 
     echo "[*] Resolving latest Kron4ek/Wine-Builds staging-amd64-wow64..."
-    WINE_URL=$(curl -fsSL https://api.github.com/repos/Kron4ek/Wine-Builds/releases/latest \
-        | grep -oE '"browser_download_url": *"[^"]*staging-amd64-wow64\.tar\.xz"' \
-        | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')
+    # Authenticate when a token is present (CI sets GITHUB_TOKEN): the anonymous
+    # api.github.com limit is 60 req/h/IP and shared runners exhaust it.
+    gh_auth=()
+    [ -n "${GITHUB_TOKEN:-}" ] && gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    # Query the releases *list*, NOT /releases/latest — "latest" is now a
+    # proton-flavored build that ships no staging asset. Take the newest release
+    # carrying a staging-amd64-wow64 tarball. Fetch and parse are split so an API
+    # failure is reported cleanly; the old `curl -f | grep | head` under pipefail
+    # both masked the guard below and could SIGPIPE-abort spuriously.
+    releases_json=$(curl -fsSL "${gh_auth[@]}" \
+        'https://api.github.com/repos/Kron4ek/Wine-Builds/releases?per_page=20') \
+        || { echo "[-] GitHub API request failed (rate limited?)"; exit 1; }
+    WINE_URL=$(printf '%s' "$releases_json" \
+        | grep -m1 -oE '"browser_download_url": *"[^"]*staging-amd64-wow64\.tar\.xz"' \
+        | sed 's/.*"\(https[^"]*\)"/\1/')
     [ -n "$WINE_URL" ] || { echo "[-] Could not resolve Kron4ek wine URL"; exit 1; }
     echo "[*] Downloading $WINE_URL"
     curl -fL -o wine.tar.xz "$WINE_URL"
