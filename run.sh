@@ -99,6 +99,8 @@ if [ -z "$INSTALLER" ] || [ ! -f "$INSTALLER" ]; then
 fi
 
 cleanup() {
+    echo
+    say "Closing Radmin VPN..."
     [ -n "$FILTER_UI_PID" ] && kill "$FILTER_UI_PID" 2>/dev/null || true
     wineserver -k 2>/dev/null || true
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
