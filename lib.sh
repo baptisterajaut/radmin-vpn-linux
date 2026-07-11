@@ -22,6 +22,13 @@ check_pass() { echo -e "${GREEN}[✓]${NC} $1"; }
 check_fail() { echo -e "${RED}[✗]${NC} $1"; }
 check_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 
+# ── Progress reporting (used by run.sh / run_vps.sh / run_datacenter.sh) ─────────
+# Step-by-step narration so the user sees what's happening during the ~30s startup.
+say()  { echo    "[*] $1"; }                 # step starting / info
+good() { echo -e "${GREEN}[+]${NC} $1"; }    # step succeeded
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }   # non-fatal warning
+die()  { echo -e "${RED}[-]${NC} $1" >&2; exit 1; }  # fatal — prints and exits
+
 # ── Wine version utils ──────────────────────────────────────────────────────────
 # AppImage (bundled) sets $APPIMAGE; system Wine does not.
 wine_version_str() { wine --version 2>/dev/null | head -n1; }
@@ -191,4 +198,123 @@ dump_diagnostics() {
     echo "Please attach the block above when reporting a bug:"
     echo "  https://github.com/baptisterajaut/radmin-vpn-linux/issues"
     echo ""
+}
+
+# ── health_check ────────────────────────────────────────────────────────────────
+# Build/preflight environment check (wine, compilers, kernel TUN/TAP, sudo, build
+# artifacts, wineprefix, stray processes). Distinct from sanity_checks() above,
+# which validates the *runtime* state of a live session. Honors $WINEPREFIX and
+# $BUILD_DIR if already set, else defaults to the repo-relative ./ paths.
+health_check() {
+    local build="${BUILD_DIR:-./build}"
+    local prefix="${WINEPREFIX:-./wineprefix}"
+
+    echo "=== Radmin VPN Linux Health Check ==="
+    echo
+
+    echo "Checking Wine installation..."
+    if command -v wine >/dev/null 2>&1; then
+        local wv wmaj
+        wv=$(wine --version)
+        check_pass "Wine installed: $wv"
+        wmaj=$(echo "$wv" | grep -oP 'wine-\K\d+' || echo "0")
+        if [ "$wmaj" -ge 11 ]; then
+            check_pass "Wine version >= 11.0"
+        else
+            check_fail "Wine version < 11.0 (required: >= 11.0)"
+        fi
+    else
+        check_fail "Wine not found"
+    fi
+    echo
+
+    echo "Checking wineserver..."
+    command -v wineserver >/dev/null 2>&1 \
+        && check_pass "wineserver found" || check_fail "wineserver not found"
+    echo
+
+    echo "Checking mingw-w64 compilers..."
+    command -v i686-w64-mingw32-gcc >/dev/null 2>&1 \
+        && check_pass "i686-w64-mingw32-gcc found" \
+        || check_fail "i686-w64-mingw32-gcc not found (run 'make install-deps')"
+    command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 \
+        && check_pass "x86_64-w64-mingw32-gcc found" \
+        || check_fail "x86_64-w64-mingw32-gcc not found (run 'make install-deps')"
+    echo
+
+    echo "Checking native gcc..."
+    command -v gcc >/dev/null 2>&1 \
+        && check_pass "gcc found" || check_fail "gcc not found"
+    echo
+
+    echo "Checking python3..."
+    command -v python3 >/dev/null 2>&1 \
+        && check_pass "python3 found: $(python3 --version)" || check_fail "python3 not found"
+    echo
+
+    echo "Checking TUN/TAP kernel support..."
+    modprobe tun 2>/dev/null \
+        && check_pass "TUN/TAP module available" || check_fail "TUN/TAP module not available"
+    [ -c /dev/net/tun ] \
+        && check_pass "/dev/net/tun device exists" || check_fail "/dev/net/tun device not found"
+    echo
+
+    echo "Checking sudo access..."
+    if sudo -n true 2>/dev/null; then
+        check_pass "Sudo access available (no password required)"
+    elif sudo -v 2>/dev/null; then
+        check_pass "Sudo access available (password required)"
+    else
+        check_fail "Sudo access not available (required for TAP device)"
+    fi
+    echo
+
+    echo "Checking build artifacts..."
+    if [ -d "$build" ]; then
+        check_pass "Build directory exists"
+        local f
+        for f in tap_bridge rvpnnetmp.sys adapter_hook.dll rvpn_launcher.exe netsh.exe netsh64.exe; do
+            [ -f "$build/$f" ] && check_pass "$f built" || check_fail "$f missing"
+        done
+    else
+        check_warn "Build directory not found (run 'make' to build)"
+    fi
+    echo
+
+    echo "Checking wineprefix..."
+    if [ -d "$prefix" ]; then
+        check_pass "wineprefix exists"
+        [ -f "$prefix/drive_c/Program Files (x86)/Radmin VPN/RvControlSvc.exe" ] \
+            && check_pass "Radmin VPN installed" \
+            || check_warn "Radmin VPN not installed in wineprefix"
+    else
+        check_warn "wineprefix not found (will be created on first run)"
+    fi
+    echo
+
+    echo "Checking for running Radmin VPN processes..."
+    pgrep -f "RvControlSvc.exe" >/dev/null 2>&1 \
+        && check_warn "RvControlSvc.exe is running" || check_pass "No RvControlSvc.exe process found"
+    pgrep -f "tap_bridge" >/dev/null 2>&1 \
+        && check_warn "tap_bridge is running" || check_pass "No tap_bridge process found"
+    echo
+
+    echo "Checking TAP device..."
+    if ip link show radminvpn0 >/dev/null 2>&1; then
+        check_pass "radminvpn0 TAP device exists"
+        ip link show radminvpn0
+    else
+        check_pass "No radminvpn0 TAP device found (normal when not running)"
+    fi
+    echo
+
+    echo "Checking for Radmin VPN installer..."
+    local installer
+    installer=$(find . -maxdepth 2 -name "Radmin_VPN_*.exe" -print -quit 2>/dev/null || true)
+    [ -n "$installer" ] \
+        && check_pass "Installer found: $installer" \
+        || check_warn "No installer found in current directory"
+    echo
+
+    echo "=== Health Check Complete ==="
 }
