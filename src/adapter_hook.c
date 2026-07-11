@@ -2,9 +2,13 @@
  * adapter_hook.dll — Wine compatibility hooks for Radmin VPN
  *
  * Injected into RvControlSvc.exe by rvpn_launcher.exe.
- * IAT hooks:
- *   - GetAdaptersAddresses: renames Linux TAP to Radmin adapter name
+ * IAT hooks (in RvControlSvc.exe AND RvROLClient.dll):
+ *   - GetAdaptersAddresses: renames Linux TAP to Radmin adapter name, and hides
+ *     every interface except the default route + our TAP (issue #16 fix).
+ *   - GetAdaptersInfo: same interface filtering (the ROL connector reads both).
  *   - RegSetKeySecurity: no-op (Wine SCM lacks SYSTEM SID)
+ *   - LoadLibraryW/A/ExW: catch RvROLClient.dll's dynamic load so we can hook
+ *     its (own) iphlpapi imports too.
  *
  * Build:
  *   i686-w64-mingw32-gcc -shared -o adapter_hook.dll adapter_hook.c \
@@ -328,10 +332,39 @@ static void install_release_guard(void)
     dbg("task-guard installed at RvControlSvc+0x636A0");
 }
 
-/* ====== GetAdaptersAddresses hook ====== */
+/* ====== Adapter-list filtering (issue #16) ======
+ *
+ * Radmin's connector (RvROLClient.dll: InitConnector -> ... -> FUN_1004b3e0)
+ * builds an ICE-style NAT-traversal candidate set from every local IP on every
+ * host interface, via GetAdaptersAddresses AND GetAdaptersInfo (plus a third
+ * gethostbyname source we don't touch). With several interfaces present
+ * (docker0, vmnet, dummy, tailscale, ...) it advertises a pile of private,
+ * unroutable candidates; the transport never converges to "connected" (state 5),
+ * CMsgStarted / ROL event 0xc never fires, and the service hangs at "registered
+ * but never ready".
+ *
+ * Fix: show Radmin only the interface that owns the default route (the one that
+ * actually reaches Famatech) + our TAP, and hide the rest. Done without relinking
+ * the caller's list: for GAA we NULL FirstUnicastAddress; for GAI we blank the
+ * address to 0.0.0.0 — both make the adapter contribute zero candidates (the
+ * gatherer already skips 0.0.0.0). If the default route can't be resolved we
+ * leave the list untouched, so we never risk hiding the only path to the net. */
 
 static ULONG (WINAPI *real_GetAdaptersAddresses)(
     ULONG, ULONG, PVOID, PIP_ADAPTER_ADDRESSES, PULONG) = NULL;
+static ULONG (WINAPI *real_GetAdaptersInfo)(PIP_ADAPTER_INFO, PULONG) = NULL;
+
+static DWORD g_tap_ifindex = 0;   /* our TAP's IfIndex, learned in the GAA hook */
+
+/* IfIndex of the interface carrying the default route (route to the internet).
+ * 0 if it can't be resolved. GetBestInterface is called unhooked (real one). */
+static DWORD default_route_ifindex(void)
+{
+    DWORD idx = 0;
+    if (GetBestInterface(inet_addr("8.8.8.8"), &idx) == NO_ERROR)
+        return idx;
+    return 0;
+}
 
 static ULONG WINAPI hook_GetAdaptersAddresses(
     ULONG Family, ULONG Flags, PVOID Rsvd,
@@ -342,17 +375,77 @@ static ULONG WINAPI hook_GetAdaptersAddresses(
     ULONG ret = real_GetAdaptersAddresses(Family, Flags, Rsvd, Addrs, Size);
     if (ret != ERROR_SUCCESS || !Addrs) return ret;
 
+    DWORD best = default_route_ifindex();
+    BOOL  best_ok = FALSE;
+
+    /* Pass 1: rename our TAP, learn its IfIndex, and confirm the default-route
+     * interface is actually one of the enumerated (non-TAP) adapters. */
     for (PIP_ADAPTER_ADDRESSES cur = Addrs; cur; cur = cur->Next) {
-        if (!cur->Description || wcscmp(cur->Description, TAP_DESC) != 0)
+        if (cur->Description && wcscmp(cur->Description, TAP_DESC) == 0) {
+            /* Read-only string literals: the caller frees the whole buffer in one
+             * shot and never touches these fields individually. */
+            cur->Description  = (WCHAR *)RADMIN_DESC;
+            cur->FriendlyName = (WCHAR *)RADMIN_FRIENDLY;
+            g_tap_ifindex = cur->IfIndex;
             continue;
+        }
+        if (best && cur->IfIndex == best)
+            best_ok = TRUE;
+    }
 
-        /* Point at read-only string literals: caller frees the whole adapter
-         * info buffer in one shot and never touches these fields individually,
-         * so we avoid a per-call HeapAlloc that was never freed. */
-        cur->Description  = (WCHAR *)RADMIN_DESC;
-        cur->FriendlyName = (WCHAR *)RADMIN_FRIENDLY;
+    if (!best || !best_ok) {
+        dbg("filter(GAA): no default-route adapter resolved -- rename only");
+        return ret;
+    }
 
-        dbg("hook: renamed radminvpn0 -> Famatech Radmin VPN Ethernet Adapter");
+    /* Pass 2: hide every adapter that is neither the TAP nor the default route. */
+    int hidden = 0;
+    for (PIP_ADAPTER_ADDRESSES cur = Addrs; cur; cur = cur->Next) {
+        if (cur->IfIndex == best || cur->IfIndex == g_tap_ifindex)
+            continue;
+        cur->FirstUnicastAddress = NULL;
+        hidden++;
+    }
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+            "filter(GAA): default-route if=%lu, TAP if=%lu, hid %d adapters",
+            (unsigned long)best, (unsigned long)g_tap_ifindex, hidden);
+        dbg(buf);
+    }
+    return ret;
+}
+
+static ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO Info, PULONG Size)
+{
+    if (!real_GetAdaptersInfo) return ERROR_NOT_SUPPORTED;
+
+    ULONG ret = real_GetAdaptersInfo(Info, Size);
+    if (ret != ERROR_SUCCESS || !Info) return ret;
+
+    DWORD best = default_route_ifindex();
+    BOOL  best_ok = FALSE;
+    for (PIP_ADAPTER_INFO cur = Info; cur; cur = cur->Next)
+        if (best && cur->Index == best) { best_ok = TRUE; break; }
+
+    if (!best || !best_ok) {
+        dbg("filter(GAI): no default-route adapter resolved -- skip");
+        return ret;
+    }
+
+    int hidden = 0;
+    for (PIP_ADAPTER_INFO cur = Info; cur; cur = cur->Next) {
+        if (cur->Index == best || (g_tap_ifindex && cur->Index == g_tap_ifindex))
+            continue;
+        /* Blank the address chain -> contributes nothing (gatherer skips 0.0.0.0). */
+        strcpy(cur->IpAddressList.IpAddress.String, "0.0.0.0");
+        cur->IpAddressList.Next = NULL;
+        hidden++;
+    }
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "filter(GAI): hid %d adapters", hidden);
+        dbg(buf);
     }
     return ret;
 }
@@ -377,70 +470,108 @@ static LONG WINAPI hook_RegSetKeySecurity(HKEY hKey, SECURITY_INFORMATION si,
 
 /* ====== IAT patching ====== */
 
-static void patch_iat(HMODULE mod)
+/* Replace mod's IAT entry for dll!fn with newfn, saving the original into *saved.
+ * Returns TRUE if the import was found and patched. */
+static BOOL hook_import(HMODULE mod, const char *dll, const char *fn,
+                        void *newfn, void **saved)
 {
-    if (!mod) return;
-
+    if (!mod) return FALSE;
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)mod;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE *)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
     DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!rva) return;
+    if (!rva) return FALSE;
 
-    PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE *)mod + rva);
-
-    for (; imp->Name; imp++) {
-        char *dll = (char *)mod + imp->Name;
+    for (PIMAGE_IMPORT_DESCRIPTOR imp =
+            (PIMAGE_IMPORT_DESCRIPTOR)((BYTE *)mod + rva); imp->Name; imp++) {
+        if (_stricmp((char *)mod + imp->Name, dll) != 0)
+            continue;
         PIMAGE_THUNK_DATA orig  = (PIMAGE_THUNK_DATA)((BYTE *)mod + imp->OriginalFirstThunk);
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE *)mod + imp->FirstThunk);
-
-        if (_stricmp(dll, "IPHLPAPI.DLL") == 0) {
-            for (; orig->u1.AddressOfData; orig++, thunk++) {
-                if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
-                PIMAGE_IMPORT_BY_NAME by_name =
-                    (PIMAGE_IMPORT_BY_NAME)((BYTE *)mod + orig->u1.AddressOfData);
-                if (strcmp(by_name->Name, "GetAdaptersAddresses") == 0) {
-                    real_GetAdaptersAddresses = (void *)thunk->u1.Function;
-                    DWORD old;
-                    if (!VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), PAGE_READWRITE, &old)) {
-                        dbg("VirtualProtect failed for GetAdaptersAddresses");
-                        continue;
-                    }
-                    thunk->u1.Function = (DWORD_PTR)hook_GetAdaptersAddresses;
-                    if (!VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), old, &old)) {
-                        dbg("VirtualProtect restore failed for GetAdaptersAddresses");
-                    }
-                    dbg("hooked GetAdaptersAddresses");
-                }
-            }
-        }
-
-        if (_stricmp(dll, "ADVAPI32.DLL") == 0) {
-            orig  = (PIMAGE_THUNK_DATA)((BYTE *)mod + imp->OriginalFirstThunk);
-            thunk = (PIMAGE_THUNK_DATA)((BYTE *)mod + imp->FirstThunk);
-            for (; orig->u1.AddressOfData; orig++, thunk++) {
-                if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
-                PIMAGE_IMPORT_BY_NAME by_name =
-                    (PIMAGE_IMPORT_BY_NAME)((BYTE *)mod + orig->u1.AddressOfData);
-                if (strcmp(by_name->Name, "RegSetKeySecurity") == 0) {
-                    real_RegSetKeySecurity = (void *)thunk->u1.Function;
-                    DWORD old;
-                    if (!VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), PAGE_READWRITE, &old)) {
-                        dbg("VirtualProtect failed for RegSetKeySecurity");
-                        continue;
-                    }
-                    thunk->u1.Function = (DWORD_PTR)hook_RegSetKeySecurity;
-                    if (!VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), old, &old)) {
-                        dbg("VirtualProtect restore failed for RegSetKeySecurity");
-                    }
-                    dbg("hooked RegSetKeySecurity");
-                }
-            }
+        for (; orig->u1.AddressOfData; orig++, thunk++) {
+            if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+            PIMAGE_IMPORT_BY_NAME bn =
+                (PIMAGE_IMPORT_BY_NAME)((BYTE *)mod + orig->u1.AddressOfData);
+            if (strcmp(bn->Name, fn) != 0) continue;
+            if (saved) *saved = (void *)thunk->u1.Function;
+            DWORD old;
+            if (!VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), PAGE_READWRITE, &old))
+                return FALSE;
+            thunk->u1.Function = (DWORD_PTR)newfn;
+            VirtualProtect(&thunk->u1.Function, sizeof(DWORD_PTR), old, &old);
+            return TRUE;
         }
     }
+    return FALSE;
+}
+
+/* Hook both iphlpapi enumerators in a module (EXE or RvROLClient.dll). The real_*
+ * globals are shared: both modules import the same iphlpapi export, so whichever
+ * we patch first captures the genuine function pointer. */
+static void hook_iphlpapi(HMODULE mod, const char *tag)
+{
+    char buf[64];
+    if (hook_import(mod, "IPHLPAPI.DLL", "GetAdaptersAddresses",
+                    hook_GetAdaptersAddresses, (void **)&real_GetAdaptersAddresses)) {
+        snprintf(buf, sizeof(buf), "hooked GetAdaptersAddresses (%s)", tag); dbg(buf);
+    }
+    if (hook_import(mod, "IPHLPAPI.DLL", "GetAdaptersInfo",
+                    hook_GetAdaptersInfo, (void **)&real_GetAdaptersInfo)) {
+        snprintf(buf, sizeof(buf), "hooked GetAdaptersInfo (%s)", tag); dbg(buf);
+    }
+}
+
+/* ---- Catch RvROLClient.dll (dynamically LoadLibrary'd) and hook its IAT ---- */
+
+static volatile LONG g_rol_patched = 0;
+
+static void try_patch_rol(void)
+{
+    if (g_rol_patched) return;
+    HMODULE rol = GetModuleHandleW(L"RvROLClient.dll");
+    if (!rol) return;
+    if (InterlockedExchange(&g_rol_patched, 1) != 0) return;   /* patch once */
+    hook_iphlpapi(rol, "RvROLClient.dll");
+    dbg("RvROLClient.dll IAT patched");
+}
+
+static HMODULE (WINAPI *real_LoadLibraryW)(LPCWSTR) = NULL;
+static HMODULE (WINAPI *real_LoadLibraryA)(LPCSTR) = NULL;
+static HMODULE (WINAPI *real_LoadLibraryExW)(LPCWSTR, HANDLE, DWORD) = NULL;
+
+static HMODULE WINAPI hook_LoadLibraryW(LPCWSTR name)
+{
+    HMODULE h = real_LoadLibraryW ? real_LoadLibraryW(name) : NULL;
+    try_patch_rol();
+    return h;
+}
+static HMODULE WINAPI hook_LoadLibraryA(LPCSTR name)
+{
+    HMODULE h = real_LoadLibraryA ? real_LoadLibraryA(name) : NULL;
+    try_patch_rol();
+    return h;
+}
+static HMODULE WINAPI hook_LoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags)
+{
+    HMODULE h = real_LoadLibraryExW ? real_LoadLibraryExW(name, file, flags) : NULL;
+    try_patch_rol();
+    return h;
+}
+
+/* Backup for the LoadLibrary hooks: covers RvROLClient.dll being pulled in by a
+ * module other than the EXE (so the EXE's LoadLibrary IAT hook never fires) or
+ * being already resident. Connector init happens seconds in, so this wins the
+ * race against the first candidate-gather.
+ * CBA: 60s @ 100ms poll; if a run shows the DLL loading later, widen the window. */
+static DWORD WINAPI rol_watch_thread(LPVOID unused)
+{
+    (void)unused;
+    for (int i = 0; i < 600 && !g_rol_patched; i++) {
+        try_patch_rol();
+        Sleep(100);
+    }
+    return 0;
 }
 
 /* ====== Exports ====== */
@@ -472,16 +603,28 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             return TRUE;
         }
 
-        patch_iat(exe);
+        /* EXE: iphlpapi enumerators (rename + filter), RegSetKeySecurity no-op,
+         * and LoadLibrary hooks to catch RvROLClient.dll's dynamic load. */
+        hook_iphlpapi(exe, "RvControlSvc.exe");
+        hook_import(exe, "ADVAPI32.DLL", "RegSetKeySecurity",
+                    hook_RegSetKeySecurity,  (void **)&real_RegSetKeySecurity);
+        hook_import(exe, "KERNEL32.dll", "LoadLibraryW",
+                    hook_LoadLibraryW,       (void **)&real_LoadLibraryW);
+        hook_import(exe, "KERNEL32.dll", "LoadLibraryA",
+                    hook_LoadLibraryA,       (void **)&real_LoadLibraryA);
+        hook_import(exe, "KERNEL32.dll", "LoadLibraryExW",
+                    hook_LoadLibraryExW,     (void **)&real_LoadLibraryExW);
+
+        /* RvROLClient.dll may already be resident; otherwise the LoadLibrary hooks
+         * and the watcher thread will catch it once it loads. */
+        try_patch_rol();
+        { HANDLE t = CreateThread(NULL, 0, rol_watch_thread, NULL, 0, NULL);
+          if (t) CloseHandle(t); }
 
         if (real_GetAdaptersAddresses && real_RegSetKeySecurity)
-            dbg("all IAT hooks installed");
-        else if (real_GetAdaptersAddresses)
-            dbg("WARNING: RegSetKeySecurity hook failed");
-        else if (real_RegSetKeySecurity)
-            dbg("WARNING: GetAdaptersAddresses hook failed");
+            dbg("core IAT hooks installed");
         else
-            dbg("WARNING: all IAT hooks failed");
+            dbg("WARNING: some core IAT hooks failed");
     }
     return TRUE;
 }
