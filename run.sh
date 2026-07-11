@@ -253,6 +253,17 @@ sudo ip link set "$TAP_DEV" allmulticast on
 sudo sysctl -w "net.ipv4.conf.$TAP_DEV.rp_filter=0" >/dev/null 2>&1 || true
 sudo sysctl -w "net.ipv4.conf.$TAP_DEV.accept_local=1" >/dev/null 2>&1 || true
 sudo ip maddr add 224.0.2.60 dev "$TAP_DEV" 2>/dev/null || true
+# Minecraft Java "Open to LAN" announces on multicast 224.0.2.60:4445 (TTL=1).
+# With no IP_MULTICAST_IF set, the kernel picks the multicast egress interface
+# from the routing table — i.e. the default route, NOT the VPN adapter — so the
+# announcement never enters the tunnel, and the browsing client's
+# joinGroup(ifindex=0) lands on the wrong interface too. A /32 route pins BOTH
+# egress and the group join onto the TAP. This is interface *selection*, not
+# forwarding, so TTL=1 survives (no decrement). Scoped to the single Minecraft
+# group so nothing else (mDNS, SSDP, Chromecast…) is disturbed. See issue #17.
+# CBA: Java only. Bedrock uses broadcast 255.255.255.255:19132 — that needs a
+# udp-broadcast-relay-redux-style reflector, not a route.
+sudo ip route add 224.0.2.60/32 dev "$TAP_DEV" 2>/dev/null || true
 # Prevent NetworkManager/avahi from cycling the VPN adapter's addresses.
 # NM treats the TAP as an external device and periodically re-configures it;
 # each address cycle triggers an NDIS adapter-removal event inside Wine,
