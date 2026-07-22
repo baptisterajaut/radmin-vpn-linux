@@ -359,13 +359,106 @@ static ULONG (WINAPI *real_GetAdaptersInfo)(PIP_ADAPTER_INFO, PULONG) = NULL;
 
 static DWORD g_tap_ifindex = 0;   /* our TAP's IfIndex, learned in the GAA hook */
 
-/* IfIndex of the interface carrying the default route (route to the internet).
- * 0 if it can't be resolved. GetBestInterface is called unhooked (real one). */
+/* TRUE if `s_addr_net` (network byte order) is a plausible uplink IPv4: not
+ * 0.0.0.0, not loopback (127/8), not link-local/APIPA (169.254/16), not CGNAT
+ * (100.64/10, Tailscale). RFC1918 private (192.168/10/172.16) IS allowed — a
+ * home uplink is almost always private, so rejecting it would reject everyone. */
+static BOOL is_uplink_v4(DWORD s_addr_net)
+{
+    DWORD h = ntohl(s_addr_net);
+    if (h == 0) return FALSE;
+    if ((h & 0xFF000000u) == 0x7F000000u) return FALSE;   /* 127.0.0.0/8   */
+    if ((h & 0xFFFF0000u) == 0xA9FE0000u) return FALSE;   /* 169.254.0.0/16 */
+    if ((h & 0xFFC00000u) == 0x64400000u) return FALSE;   /* 100.64.0.0/10  */
+    return TRUE;
+}
+
+/* IfIndex of the interface carrying the default route (route to the internet),
+ * or 0 if it can't be resolved *unambiguously*.
+ *
+ * Issue #19: on some hosts (Arch/zen, Fedora reporters) Wine's
+ * GetBestInterface(8.8.8.8) either fails or returns an IfIndex that matches no
+ * adapter enumerated by GetAdaptersAddresses. The callers then can't confirm the
+ * uplink (best_ok stays FALSE) and fall back to leaking every interface's IPs as
+ * NAT candidates -> ROL never registers.
+ *
+ * Layered, and always keyed on a REAL enumerated IfIndex so the result is
+ * directly usable by the callers:
+ *   1. Fast path: GetBestInterface(8.8.8.8), but only trust it if its IfIndex is
+ *      actually one of the enumerated adapters (the check the reporters failed).
+ *   2. Fallback: the single UP adapter that owns a FirstGatewayAddress AND a
+ *      routable IPv4. Wine mirrors the host forward table into FirstGatewayAddress
+ *      (populated ONLY on the default-route iface — verified empirically: docker0,
+ *      bridges, veth, lo all show no gateway), a signal it fills even when
+ *      GetBestInterface's index is unusable.
+ * CONSERVATISM: picking the wrong uplink hides the real path (worse than the
+ * current leak), so if the fallback is ambiguous (0 or >1 candidate) we return 0
+ * and the caller keeps its safe behavior (GAA rename-only, empty candidate set).
+ * Uses the REAL GAA (no recursion into our hook). */
 static DWORD default_route_ifindex(void)
 {
-    DWORD idx = 0;
-    if (GetBestInterface(inet_addr("8.8.8.8"), &idx) == NO_ERROR)
-        return idx;
+    if (!real_GetAdaptersAddresses) {
+        /* Hooks not wired up yet — best-effort raw call. */
+        DWORD idx = 0;
+        if (GetBestInterface(inet_addr("8.8.8.8"), &idx) == NO_ERROR && idx)
+            return idx;
+        return 0;
+    }
+
+    ULONG size = 15 * 1024;
+    IP_ADAPTER_ADDRESSES *buf = (IP_ADAPTER_ADDRESSES *)malloc(size);
+    if (!buf) return 0;
+    ULONG r = real_GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS,
+                                        NULL, buf, &size);
+    if (r == ERROR_BUFFER_OVERFLOW) {
+        IP_ADAPTER_ADDRESSES *nb = (IP_ADAPTER_ADDRESSES *)realloc(buf, size);
+        if (!nb) { free(buf); return 0; }
+        buf = nb;
+        r = real_GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS,
+                                      NULL, buf, &size);
+    }
+    if (r != ERROR_SUCCESS) { free(buf); return 0; }
+
+    /* 1. Fast path: GetBestInterface, confirmed against the enumeration. */
+    DWORD best = 0;
+    if (GetBestInterface(inet_addr("8.8.8.8"), &best) == NO_ERROR && best) {
+        for (IP_ADAPTER_ADDRESSES *a = buf; a; a = a->Next) {
+            if (a->IfIndex == best) {
+                free(buf);
+                dbg("uplink: GetBestInterface fast-path");
+                return best;
+            }
+        }
+    }
+
+    /* 2. Fallback: unique UP adapter with a gateway + routable IPv4. */
+    DWORD found = 0;
+    int n = 0;
+    for (IP_ADAPTER_ADDRESSES *a = buf; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        if (!a->FirstGatewayAddress) continue;
+        BOOL has_v4 = FALSE;
+        for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u; u = u->Next) {
+            if (u->Address.lpSockaddr &&
+                u->Address.lpSockaddr->sa_family == AF_INET &&
+                is_uplink_v4(((struct sockaddr_in *)
+                              u->Address.lpSockaddr)->sin_addr.s_addr)) {
+                has_v4 = TRUE;
+                break;
+            }
+        }
+        if (!has_v4) continue;
+        n++;
+        found = a->IfIndex;
+    }
+    free(buf);
+
+    if (n == 1) {
+        dbg("uplink: gateway fallback (GetBestInterface unusable)");
+        return found;
+    }
+    dbg(n == 0 ? "uplink: unresolved (no gateway+routable adapter) -> 0"
+               : "uplink: ambiguous (>1 gateway adapter) -> 0");
     return 0;
 }
 
@@ -464,11 +557,18 @@ static ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO Info, PULONG Size)
  * hung with docker+tailscale up. RvROLClient imports gethostbyname by ORDINAL
  * (WS2_32 #52), which is why the name-based IAT hook never reached it.
  *
- * Policy (single best uplink + TAP, IPv4-only). We compute the set of IPv4
- * addresses owned by the default-route interface + our TAP, then keep only
- * those in the results of the local-hostname lookup. Every ambiguity biases to
- * PASSTHROUGH: over-filtering (hiding the only path) is a regression, while
- * under-filtering is just the leaky status quo. */
+ * Policy (rc7): a local-hostname lookup is ONLY ever the candidate gatherer
+ * (RvROLClient FUN_1004b760 -- verified by RE; it is the sole leak, GAA is
+ * OperStatus+FirstUnicastAddress gated and GAI's 0.0.0.0 blanking is honoured by
+ * the insert skip-list). Its results become *advertised host candidates*, never a
+ * path to any server -- so over-filtering here is harmless (relay/STUN are a
+ * separate connect() to server IPs) while under-filtering is the actual bug. So
+ * for a local-hostname hit we filter to {uplink, TAP} and, on ANY uncertainty,
+ * EMPTY the result rather than pass the polluted set through. This is the opposite
+ * of rc6's "bias to passthrough", which silently leaked docker0 & co (a DOWN,
+ * route-less 172.17.0.1 resolved via nss-myhostname). Server lookups
+ * (is_local_hostname false) are never touched. Every call is logged now, so a
+ * single run shows exactly what the gatherer asked for and got. */
 
 #define WS2_ORD_GETHOSTBYNAME 52          /* WS2_32.dll ordinal (verified) */
 #define ALLOWED_MAX           32
@@ -568,32 +668,58 @@ static BOOL is_local_hostname(const char *name)
     return _stricmp(a, b) == 0;
 }
 
+/* Log a gethostbyname call verbatim: the queried name, whether we treat it as the
+ * local host, and every A record returned. rc6 only logged on drop, so a silent
+ * passthrough (name-gate miss, no allow-set, zero survivors) left us blind to what
+ * the gatherer actually asked for -- the exact hole that hid the docker0 leak. */
+static void log_ghbn(const char *name, BOOL local, struct hostent *h)
+{
+    char b[512];
+    int n = snprintf(b, sizeof b, "gethostbyname('%s') local=%d ->",
+                     name ? name : "(null)", local ? 1 : 0);
+    if (h && h->h_addrtype == AF_INET && h->h_addr_list && h->h_addr_list[0]) {
+        for (char **rd = h->h_addr_list; *rd && n < (int)sizeof b - 20; rd++) {
+            struct in_addr a; a.s_addr = *(DWORD *)*rd;
+            n += snprintf(b + n, sizeof b - n, " %s", inet_ntoa(a));
+        }
+    } else {
+        snprintf(b + n, sizeof b - n, " (no A records)");
+    }
+    dbg(b);
+}
+
 static struct hostent *WINAPI hook_gethostbyname(const char *name)
 {
     struct hostent *h = real_gethostbyname ? real_gethostbyname(name) : NULL;
     if (!h || h->h_addrtype != AF_INET || !h->h_addr_list) return h;
-    if (!is_local_hostname(name)) return h;         /* protects server lookups */
-    build_allowed_v4();
-    if (!g_allowed_valid) return h;
 
-    /* Count survivors first: if none would remain, pass through untouched rather
-     * than hand back an empty list (a naive caller derefs h_addr_list[0]). */
-    int keep = 0;
-    for (char **rd = h->h_addr_list; *rd; rd++)
-        if (in_allowed_v4(*(DWORD *)*rd)) keep++;
-    if (keep == 0) return h;
+    BOOL local = is_local_hostname(name);
+    log_ghbn(name, local, h);
+    if (!local) return h;                       /* server/peer lookups: never touch */
+
+    /* Local-hostname == candidate gathering (the only consumer). Filter hard to
+     * {uplink, TAP}; on any uncertainty EMPTY the result rather than pass through.
+     * The real caller (FUN_1004b760) checks h_addr_list[0] == NULL and skips, so an
+     * empty list is safe; advertising zero host candidates just falls back to the
+     * relay path, which is what we want. See the policy note above. */
+    build_allowed_v4();
+    if (!g_allowed_valid) {
+        h->h_addr_list[0] = NULL;
+        dbg("filter(gethostbyname): allow-set unavailable -> emptied local candidates");
+        return h;
+    }
 
     char **rd = h->h_addr_list, **wr = h->h_addr_list;
-    int dropped = 0;
+    int kept = 0, dropped = 0;
     for (; *rd; rd++) {
-        if (in_allowed_v4(*(DWORD *)*rd)) *wr++ = *rd;
+        if (in_allowed_v4(*(DWORD *)*rd)) { *wr++ = *rd; kept++; }
         else dropped++;
     }
     *wr = NULL;
-    if (dropped) {
+    {
         char b[96];
-        snprintf(b, sizeof b, "filter(gethostbyname): kept %d, dropped %d local addr(s)",
-                 keep, dropped);
+        snprintf(b, sizeof b, "filter(gethostbyname): kept %d, dropped %d (allow-set=%d)",
+                 kept, dropped, g_allowed_n);
         dbg(b);
     }
     return h;
@@ -605,7 +731,13 @@ static int WINAPI hook_getaddrinfo(const char *node, const char *service,
     int rc = real_getaddrinfo ? real_getaddrinfo(node, service, hints, res)
                               : EAI_FAIL;
     if (rc != 0 || !res || !*res) return rc;
-    if (!is_local_hostname(node)) return rc;        /* protects server lookups */
+    BOOL local = is_local_hostname(node);
+    {
+        char b[160];
+        snprintf(b, sizeof b, "getaddrinfo('%s') local=%d", node ? node : "(null)", local ? 1 : 0);
+        dbg(b);
+    }
+    if (!local) return rc;                          /* protects server lookups */
     build_allowed_v4();
     if (!g_allowed_valid) return rc;
 
