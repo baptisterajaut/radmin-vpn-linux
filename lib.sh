@@ -79,10 +79,10 @@ sanity_checks() {
     [ -f "$WINEPREFIX/drive_c/windows/syswow64/netsh.exe" ] \
         && diag_ok "netsh.exe wrapper installed" \
         || diag_miss "netsh.exe wrapper missing"
-    if [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b ]; then
-        diag_ok "FIFOs /tmp/rvpn_{b2d,d2b}"
+    if [ -p /tmp/rvpn_b2d ] && [ -p /tmp/rvpn_d2b_high ] && [ -p /tmp/rvpn_d2b_low ]; then
+        diag_ok "FIFOs /tmp/rvpn_{b2d,d2b_high,d2b_low}"
     else
-        diag_miss "FIFOs /tmp/rvpn_{b2d,d2b}"
+        diag_miss "FIFOs /tmp/rvpn_{b2d,d2b_high,d2b_low}"
     fi
     if [ -f /tmp/rvpn_mac ] && [ "$(stat -c%s /tmp/rvpn_mac 2>/dev/null)" = "6" ]; then
         diag_ok "/tmp/rvpn_mac (6 bytes)"
@@ -158,10 +158,12 @@ dump_diagnostics() {
     echo ""
 
     echo "--- Outbound connections (service → Famatech) ---"
+    # Match only the service process (ss/netstat show its comm truncated to
+    # "RvControlSvc.e"); a bare wine/.exe match caught unrelated Proton games.
     if command -v ss >/dev/null 2>&1; then
-        ss -tanp 2>/dev/null | grep -iE 'wine|radmin|RvControlSvc|\.exe' | sed 's/^/  /' || true
+        ss -tanp 2>/dev/null | grep 'RvControlSvc' | sed 's/^/  /' || true
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -tanp 2>/dev/null | grep -iE 'wine|radmin|RvControlSvc|\.exe' | sed 's/^/  /' || true
+        netstat -tanp 2>/dev/null | grep 'RvControlSvc' | sed 's/^/  /' || true
     else
         echo "  (neither ss nor netstat available)"
     fi
