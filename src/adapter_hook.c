@@ -580,6 +580,8 @@ static BOOL  g_allowed_valid = FALSE;
 static struct hostent *(WINAPI *real_gethostbyname)(const char *) = NULL;
 static int (WINAPI *real_getaddrinfo)(const char *, const char *,
     const struct addrinfo *, struct addrinfo **) = NULL;
+static int (WSAAPI *real_getnameinfo)(const SOCKADDR *, socklen_t,
+    PCHAR, DWORD, PCHAR, DWORD, INT) = NULL;
 
 /* 100.64.0.0/10 — CGNAT range used by Tailscale et al. */
 static BOOL is_cgnat(DWORD s_addr_net)
@@ -776,6 +778,61 @@ static int WINAPI hook_getaddrinfo(const char *node, const char *service,
     return rc;
 }
 
+/* ====== Reverse-DNS short-circuit: getnameinfo (issue #16, the real one) ======
+ *
+ * The candidate/peer path reverse-resolves local IPv4 via getnameinfo (imported
+ * by name in both RvControlSvc.exe and RvROLClient.dll; gethostbyaddr is not
+ * imported). On a host whose resolver black-holes RFC1918 PTR queries — e.g.
+ * systemd-resolved with `hosts: ... resolve ... myhostname` forwarding upstream,
+ * where no resolver answers the PTR for docker0's 172.17.0.1 — that call blocks
+ * ~5s per attempt and retries for over two minutes, past Radmin's own deadline:
+ * "registered but never ready". Diagnosed by ayozetr (A/B via /etc/hosts +
+ * tcpdump; reproducible outside Wine with socket.gethostbyaddr('172.17.0.1')).
+ *
+ * These addresses have no useful PTR and Radmin only ever uses them numerically,
+ * so we short-circuit the reverse lookup for private/link-local/CGNAT/loopback
+ * IPv4 — return the numeric host (as NI_NUMERICHOST would) and the numeric port,
+ * rc 0. Public addresses fall through to the real getnameinfo (they resolve fast
+ * and a real PTR may matter). This runs regardless of interface count or our GAA
+ * filter — it's an orthogonal, unhooked reverse path. */
+static BOOL is_private_v4(DWORD s_addr_net)
+{
+    DWORD h = ntohl(s_addr_net);
+    if ((h & 0xFF000000u) == 0x7F000000u) return TRUE;   /* 127.0.0.0/8  loopback */
+    if ((h & 0xFF000000u) == 0x0A000000u) return TRUE;   /* 10.0.0.0/8            */
+    if ((h & 0xFFF00000u) == 0xAC100000u) return TRUE;   /* 172.16.0.0/12         */
+    if ((h & 0xFFFF0000u) == 0xC0A80000u) return TRUE;   /* 192.168.0.0/16        */
+    if ((h & 0xFFFF0000u) == 0xA9FE0000u) return TRUE;   /* 169.254.0.0/16 APIPA  */
+    if ((h & 0xFFC00000u) == 0x64400000u) return TRUE;   /* 100.64.0.0/10  CGNAT  */
+    return FALSE;
+}
+
+static int WSAAPI hook_getnameinfo(const SOCKADDR *sa, socklen_t salen,
+    PCHAR host, DWORD hostlen, PCHAR serv, DWORD servlen, INT flags)
+{
+    if (sa && sa->sa_family == AF_INET &&
+        salen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *si = (const struct sockaddr_in *)sa;
+        if (is_private_v4(si->sin_addr.s_addr)) {
+            char ip[16];
+            lstrcpynA(ip, inet_ntoa(si->sin_addr), sizeof ip);
+            if (host && hostlen) lstrcpynA(host, ip, hostlen);
+            if (serv && servlen) {
+                char pb[8];
+                snprintf(pb, sizeof pb, "%u", (unsigned)ntohs(si->sin_port));
+                lstrcpynA(serv, pb, servlen);
+            }
+            { char b[64];
+              snprintf(b, sizeof b, "getnameinfo: short-circuit PTR %s", ip);
+              dbg(b); }
+            return 0;
+        }
+    }
+    return real_getnameinfo
+        ? real_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags)
+        : EAI_FAIL;
+}
+
 /* ====== RegSetKeySecurity hook ======
  *
  * Radmin calls RegSetKeySecurity on the Registration subkey with a DACL
@@ -858,9 +915,9 @@ static void hook_iphlpapi(HMODULE mod, const char *tag)
     }
 }
 
-/* Hook the ws2_32 local-address sources in a module: gethostbyname (imported by
- * ORDINAL 52) and getaddrinfo (imported by name). Shared real_* globals, same as
- * the iphlpapi pair. */
+/* Hook the ws2_32 name/address sources in a module: gethostbyname (imported by
+ * ORDINAL 52), getaddrinfo (forward, by name), and getnameinfo (reverse, by
+ * name). Shared real_* globals, same as the iphlpapi pair. */
 static void hook_ws2_32(HMODULE mod, const char *tag)
 {
     char buf[64];
@@ -871,6 +928,10 @@ static void hook_ws2_32(HMODULE mod, const char *tag)
     if (hook_import(mod, "WS2_32.DLL", "getaddrinfo", 0,
                     hook_getaddrinfo, (void **)&real_getaddrinfo)) {
         snprintf(buf, sizeof(buf), "hooked getaddrinfo (%s)", tag); dbg(buf);
+    }
+    if (hook_import(mod, "WS2_32.DLL", "getnameinfo", 0,
+                    hook_getnameinfo, (void **)&real_getnameinfo)) {
+        snprintf(buf, sizeof(buf), "hooked getnameinfo (%s)", tag); dbg(buf);
     }
 }
 
