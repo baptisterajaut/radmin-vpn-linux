@@ -827,10 +827,96 @@ static int WSAAPI hook_getnameinfo(const SOCKADDR *sa, socklen_t salen,
               dbg(b); }
             return 0;
         }
+        /* Public IPv4: a real PTR may matter, so it goes through — but it is the
+         * only remaining call that can block, so leave a trace of it. */
+        { char b[64];
+          snprintf(b, sizeof b, "getnameinfo: passthrough %s",
+                   inet_ntoa(si->sin_addr));
+          dbg(b); }
     }
     return real_getnameinfo
         ? real_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags)
         : EAI_FAIL;
+}
+
+/* ---- The reverse path that actually runs: GetNameInfoW via GetProcAddress ----
+ *
+ * The IAT hook above only covers modules importing `getnameinfo` by name, and
+ * on the reporting hosts it never fired. Reason, established statically:
+ *
+ *   1. The candidate gatherer resolves **GetNameInfoW** dynamically with
+ *      GetProcAddress (neither binary imports it — no IAT entry to patch).
+ *   2. Wine's ws2_32 implements GetNameInfoW with a direct intra-module call
+ *      to getnameinfo's real entry point, verified in the shipped i386 build:
+ *          10002d05: e8 26 d2 00 00   call 1000ff30 <_getnameinfo@28>
+ *      so the call never traverses an IAT nor the export thunk.
+ *   3. Only the *PE* getnameinfo carries a +winsock TRACE (protocol.c);
+ *      unix_getnameinfo has none. So a trace line proves the PE side ran —
+ *      the reverse path is reachable from in-process after all.
+ *
+ * We therefore intercept the resolution itself rather than the call site:
+ * hook GetProcAddress and hand back our own wrapper. Same short-circuit rule
+ * as hook_getnameinfo, so both entry points behave identically. */
+
+typedef int (WSAAPI *gni_a_t)(const SOCKADDR *, socklen_t,
+    PCHAR, DWORD, PCHAR, DWORD, INT);
+typedef int (WSAAPI *gni_w_t)(const SOCKADDR *, socklen_t,
+    PWCHAR, DWORD, PWCHAR, DWORD, INT);
+
+static gni_w_t real_GetNameInfoW = NULL;
+
+static int WSAAPI hook_GetNameInfoW(const SOCKADDR *sa, socklen_t salen,
+    PWCHAR host, DWORD hostlen, PWCHAR serv, DWORD servlen, INT flags)
+{
+    if (sa && sa->sa_family == AF_INET &&
+        salen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *si = (const struct sockaddr_in *)sa;
+        if (is_private_v4(si->sin_addr.s_addr)) {
+            char ip[16], pb[8];
+            lstrcpynA(ip, inet_ntoa(si->sin_addr), sizeof ip);
+            snprintf(pb, sizeof pb, "%u", (unsigned)ntohs(si->sin_port));
+            if (host && hostlen)
+                MultiByteToWideChar(CP_ACP, 0, ip, -1, host, hostlen);
+            if (serv && servlen)
+                MultiByteToWideChar(CP_ACP, 0, pb, -1, serv, servlen);
+            { char b[80];
+              snprintf(b, sizeof b, "GetNameInfoW: short-circuit PTR %s", ip);
+              dbg(b); }
+            return 0;
+        }
+        { char b[64];
+          snprintf(b, sizeof b, "GetNameInfoW: passthrough %s",
+                   inet_ntoa(si->sin_addr));
+          dbg(b); }
+    }
+    return real_GetNameInfoW
+        ? real_GetNameInfoW(sa, salen, host, hostlen, serv, servlen, flags)
+        : EAI_FAIL;
+}
+
+static FARPROC (WINAPI *real_GetProcAddress)(HMODULE, LPCSTR) = NULL;
+
+static FARPROC WINAPI hook_GetProcAddress(HMODULE mod, LPCSTR name)
+{
+    FARPROC p = real_GetProcAddress ? real_GetProcAddress(mod, name) : NULL;
+
+    /* Imports by ordinal arrive as a low-word integer, not a string pointer. */
+    if (!p || !name || ((DWORD_PTR)name >> 16) == 0)
+        return p;
+    if (mod != GetModuleHandleA("ws2_32.dll"))
+        return p;
+
+    if (strcmp(name, "GetNameInfoW") == 0) {
+        real_GetNameInfoW = (gni_w_t)p;
+        dbg("GetProcAddress: handed out hooked GetNameInfoW");
+        return (FARPROC)hook_GetNameInfoW;
+    }
+    if (strcmp(name, "getnameinfo") == 0) {
+        real_getnameinfo = (gni_a_t)p;
+        dbg("GetProcAddress: handed out hooked getnameinfo");
+        return (FARPROC)hook_getnameinfo;
+    }
+    return p;
 }
 
 /* ====== RegSetKeySecurity hook ======
@@ -947,6 +1033,10 @@ static void try_patch_rol(void)
     if (InterlockedExchange(&g_rol_patched, 1) != 0) return;   /* patch once */
     hook_iphlpapi(rol, "RvROLClient.dll");
     hook_ws2_32(rol, "RvROLClient.dll");
+    /* This is the module that resolves GetNameInfoW dynamically (issue #16). */
+    if (hook_import(rol, "KERNEL32.dll", "GetProcAddress", 0,
+                    hook_GetProcAddress, (void **)&real_GetProcAddress))
+        dbg("hooked GetProcAddress (RvROLClient.dll)");
     dbg("RvROLClient.dll IAT patched");
 }
 
@@ -1029,6 +1119,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
                     hook_LoadLibraryA,       (void **)&real_LoadLibraryA);
         hook_import(exe, "KERNEL32.dll", "LoadLibraryExW", 0,
                     hook_LoadLibraryExW,     (void **)&real_LoadLibraryExW);
+        hook_import(exe, "KERNEL32.dll", "GetProcAddress", 0,
+                    hook_GetProcAddress,     (void **)&real_GetProcAddress);
 
         /* RvROLClient.dll may already be resident; otherwise the LoadLibrary hooks
          * and the watcher thread will catch it once it loads. */
