@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # run-in-netns.sh — Run Radmin VPN inside an isolated network namespace.
 #
 # Contributed by ayozetr (https://github.com/ayozetr), who diagnosed the whole

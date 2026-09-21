@@ -13,6 +13,7 @@ STRIP_FLAGS = -s -S --strip-debug --strip-unneeded
 #   Debian/Ubuntu:  /usr/x86_64-w64-mingw32/include/ddk
 #   Fedora/RHEL:    /usr/x86_64-w64-mingw32/sys-root/mingw/include/ddk
 DDK_INC := $(firstword $(wildcard \
+    $(DDK_PATH64) \
     /usr/x86_64-w64-mingw32/include/ddk \
     /usr/x86_64-w64-mingw32/sys-root/mingw/include/ddk \
     /usr/x86_64-w64-mingw32/sys-root/mingw/include \
