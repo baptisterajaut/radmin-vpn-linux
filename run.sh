@@ -8,6 +8,9 @@
 #   --fix-chat   patch Qt qwindows.dll to fix the chat crash (off by default)
 set -euo pipefail
 
+# Kept for the vendor-update re-exec. The parser below shifts "$@".
+ORIG_ARGS=("$@")
+
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Shared diagnostics/health library (colors, check_*, dump_diagnostics).
@@ -117,6 +120,86 @@ if [ "$DO_UPDATE" -eq 1 ] && [ -z "$INSTALLER_EXPLICIT" ]; then
     INSTALLER=""
 fi
 
+# A Radmin installer executing in this prefix. Prints "version<TAB>linux-path".
+# A downloaded exe that is not running does not count, so closing the window
+# still shuts the VPN down.
+running_vendor_installer() {
+    local proc arg args exe ver rel path
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        exe=""
+        ver=""
+        path=""
+        args=()
+        mapfile -d '' args < "$proc/cmdline" || true
+        for arg in "${args[@]}"; do
+            case "$arg" in
+                *Radmin_VPN_[0-9]*.exe)
+                    exe="${arg##*\\}"
+                    exe="${exe##*/}"
+                    ver=$(printf '%s' "$exe" | sed -n 's/^Radmin_VPN_\([0-9.][0-9.]*\)\.exe$/\1/p')
+                    case "$arg" in
+                        [A-Za-z]:\\*)
+                            rel=$(printf '%s' "$arg" | sed 's|^[A-Za-z]:\\||; s|\\|/|g')
+                            path="$WINEPREFIX/drive_c/$rel"
+                            ;;
+                        /*)
+                            path="$arg"
+                            ;;
+                    esac
+                    ;;
+            esac
+        done
+        [ -n "$ver" ] || continue
+        if [ -z "$path" ] || [ ! -f "$path" ]; then
+            path=$(find "$WINEPREFIX/drive_c/users" "$WINEPREFIX/drive_c/ProgramData" \
+                -name "Radmin_VPN_${ver}.exe" -type f 2>/dev/null | head -n1 || true)
+        fi
+        [ -n "$path" ] && [ -f "$path" ] || continue
+        printf '%s\t%s\n' "$ver" "$path"
+        return 0
+    done
+    return 1
+}
+
+# Stop the installer the GUI just spawned, without taking the tunnel down.
+kill_vendor_installer() {
+    local proc arg args hit pid
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        hit=0
+        args=()
+        mapfile -d '' args < "$proc/cmdline" || true
+        for arg in "${args[@]}"; do
+            case "$arg" in
+                *Radmin_VPN_[0-9]*.exe|*msiexec*|*RadminVPN_[0-9]*.msi) hit=1 ;;
+            esac
+        done
+        [ "$hit" -eq 1 ] || continue
+        [ -r "$proc/environ" ] || continue
+        tr '\0' '\n' < "$proc/environ" | grep -qxF "WINEPREFIX=$WINEPREFIX" || continue
+        pid="${proc#/proc/}"
+        kill "$pid" 2>/dev/null || true
+    done
+}
+
+# Tear the live tunnel down without exiting. Used before a controlled update;
+# the process re-execs run.sh afterwards, which builds the tunnel again.
+stop_live_session() {
+    [ -n "$FILTER_UI_PID" ] && kill "$FILTER_UI_PID" 2>/dev/null || true
+    wineserver -k 2>/dev/null || true
+    [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
+    [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null || true
+    [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
+    sudo ip link delete "$TAP_DEV" 2>/dev/null || true
+    rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b \
+          /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac /tmp/rvpn_filters.json
+    FILTER_UI_PID=""
+    BRIDGE_PID=""
+    RELAY_PID=""
+    MONITOR_PID=""
+}
+
 cleanup() {
     echo
     say "Closing Radmin VPN..."
@@ -225,13 +308,19 @@ install_radmin() {
     if ! verify_installer "$INSTALLER"; then
         # Drop our own poisoned cache so the next run refetches, but never delete
         # a file the user pointed us at themselves.
+        local _verify_msg
         case "$INSTALLER" in
             "$DOWNLOAD_DIR"/*)
                 rm -f -- "$INSTALLER"
-                die "installer failed verification; cached copy removed — re-run to download it again" ;;
+                _verify_msg="installer failed verification; cached copy removed — re-run to download it again" ;;
             *)
-                die "installer failed verification — refusing to run it" ;;
+                _verify_msg="installer failed verification — refusing to run it" ;;
         esac
+        if [ "${RVPN_INSTALL_SOFT:-0}" = 1 ]; then
+            warn "$_verify_msg"
+            return 1
+        fi
+        die "$_verify_msg"
     fi
     mkdir -p "$WINEPREFIX"
     wineboot --init 2>/dev/null
@@ -242,11 +331,28 @@ install_radmin() {
     say "Running installer..."
     wine "$INSTALLER" /VERYSILENT /NORESTART 2>/dev/null || true
     say "Waiting for installer to finish..."
+    # The exe is already on disk during an upgrade, so waiting for the file
+    # returns immediately and wineserver -k used to kill the MSI mid-install.
+    for _ in $(seq 1 180); do
+        if running_vendor_installer >/dev/null; then
+            sleep 1
+            continue
+        fi
+        break
+    done
+    if running_vendor_installer >/dev/null; then
+        warn "installer still running after 3 minutes, stopping it"
+        wineserver -k 2>/dev/null || true
+    fi
     for _ in $(seq 1 30); do
-        sleep 0.5
         [ -f "$RADMIN/RvControlSvc.exe" ] && break
+        sleep 0.5
     done
     if [ ! -f "$RADMIN/RvControlSvc.exe" ]; then
+        if [ "${RVPN_INSTALL_SOFT:-0}" = 1 ]; then
+            warn "installation failed"
+            return 1
+        fi
         die "installation failed"
     fi
     wineserver -k 2>/dev/null || true
@@ -277,9 +383,9 @@ elif [ "$DO_UPDATE" -eq 1 ]; then
         good "Radmin VPN updated to ${INSTALLED_VERSION:-$RADMIN_VERSION}"
     fi
 elif [ -n "$INSTALLED_VERSION" ] && version_gt "$RADMIN_VERSION" "$INSTALLED_VERSION"; then
-    # Radmin's own updater would otherwise push this mid-session and take the
-    # running service down with it — better we do it, stopped and in control.
-    warn "Radmin VPN $INSTALLED_VERSION installed, $RADMIN_VERSION validated — run './run.sh --update' to upgrade (keeps your prefix and RID)"
+    # The GUI updater is applied from the session loop when it launches the
+    # pinned build. --update remains the way to do it before connecting.
+    warn "Radmin VPN $INSTALLED_VERSION installed, $RADMIN_VERSION validated — an in-app update to that version is applied automatically"
 fi
 
 install_components
@@ -598,15 +704,62 @@ fi
 good "Radmin VPN running — close the GUI or press Ctrl+C to stop."
 
 
-# A GUI that dies must not take a working tunnel with it. Closing the window
-# yourself exits 0 and still shuts everything down (the documented behaviour); a
-# crash exits non-zero, and then we restart the GUI once and otherwise keep the
-# VPN up headless. Radmin's own updater is the usual killer here: it runs a newer
-# installer inside the live prefix, which kills the GUI and faults the service.
+# Exit 0 is "the user closed the window", and also what Radmin's updater does
+# after it starts its installer. A live installer is the second case: stop the
+# tunnel, run that installer while Wine is down, scrub the real NDIS driver,
+# then re-exec so the service comes back. A build newer than RADMIN_VERSION is
+# refused and the tunnel stays up without the GUI, because that updater would
+# close every new window. A crash (non-zero) still restarts the GUI once.
+handoff_vendor_update() {
+    local info ver src dest installed
+    info=$(running_vendor_installer) || return 1
+    ver="${info%%$'\t'*}"
+    src="${info#*$'\t'}"
+    installed="$(radmin_installed_version || true)"
+
+    if version_gt "$ver" "$RADMIN_VERSION"; then
+        warn "Radmin updater wants $ver, newer than validated $RADMIN_VERSION — installer stopped, tunnel stays up"
+        warn "The GUI stays closed so the updater cannot launch that build again. Ctrl+C to stop."
+        kill_vendor_installer
+        GUI_PID=""
+        return 0
+    fi
+    if [ -n "$installed" ] && ! version_gt "$ver" "$installed"; then
+        return 1
+    fi
+    if [ "${RVPN_VENDOR_UPDATE_TRIED:-}" = "$ver" ]; then
+        warn "Update to $ver was already attempted this session — installer stopped, tunnel stays up"
+        kill_vendor_installer
+        GUI_PID=""
+        return 0
+    fi
+
+    say "Radmin updater launched $ver — stopping the tunnel and applying it"
+    dest="$DOWNLOAD_DIR/Radmin_VPN_${ver}.exe"
+    mkdir -p "$DOWNLOAD_DIR"
+    cp -f "$src" "$dest"
+    stop_live_session
+    INSTALLER="$dest"
+    INSTALLER_EXPLICIT=1
+    RVPN_INSTALL_SOFT=1
+    if ! install_radmin; then
+        warn "Update to $ver failed — bringing the previous session back"
+    else
+        good "Radmin VPN updated to $(radmin_installed_version || echo "$ver"), restarting"
+    fi
+    export RVPN_VENDOR_UPDATE_TRIED="$ver"
+    trap - EXIT
+    exec bash "$DIR/run.sh" "${ORIG_ARGS[@]}"
+}
+
 GUI_RESTARTED=0
 while [ -n "$GUI_PID" ]; do
     _gui_rc=0
     wait "$GUI_PID" || _gui_rc=$?
+    if handoff_vendor_update; then
+        [ -z "$GUI_PID" ] && break
+        continue
+    fi
     [ "$_gui_rc" -eq 0 ] && break          # user closed the window → normal exit
     if [ "$GUI_RESTARTED" -eq 0 ]; then
         warn "GUI exited abnormally (code $_gui_rc) — VPN stays up, restarting the GUI once"
@@ -614,9 +767,7 @@ while [ -n "$GUI_PID" ]; do
         start_gui
     else
         warn "GUI crashed again (code $_gui_rc) — continuing headless, VPN still up. Ctrl+C to stop."
-        warn "See /tmp/radmin_gui.log. If it mentions an installer under AppData\\Local\\Temp,"
-        warn "Radmin's auto-updater is the cause: turn off 'Automatic updates' in the GUI settings,"
-        warn "or upgrade in a controlled way with './run.sh --update'."
+        warn "See /tmp/radmin_gui.log."
         GUI_PID=""
     fi
 done

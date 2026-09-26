@@ -29,12 +29,11 @@ On first launch it downloads the Radmin VPN installer it is validated against (o
 
 Persistent state (wineprefix, MAC, logs) lives in `~/.local/share/radmin-vpn-linux/`.
 
-> **Radmin closing by itself?** Its own updater is installing a newer build inside the running
-> prefix. Do the upgrade in a controlled way instead — it keeps your prefix and your Radmin ID:
-> ```bash
-> ./RadminVPN-Linux-x86_64.AppImage --update
-> ```
-> Then turn off "Automatic updates" in the Radmin settings so it stops trying. Details in
+> **Radmin closing by itself?** Older launchers treated the updater's window-close as you
+> quitting, so the tunnel died and the install never finished. The launcher now stops the
+> tunnel, applies the installer when it is the validated version, and starts the VPN again.
+> A build newer than the validated one is refused and the tunnel stays up without the GUI.
+> `./RadminVPN-Linux-x86_64.AppImage --update` still upgrades before you connect. Details in
 > [Radmin's own auto-updater](#radmins-own-auto-updater).
 
 ## Prerequisites (source build / non-AppImage)
@@ -96,13 +95,16 @@ On subsequent runs, just:
 
 ### Radmin's own auto-updater
 
-Radmin's GUI can download a newer build and run its installer *inside the live prefix*,
-which kills the GUI and faults the running service (the GUI log then shows an installer
-under `AppData\\Local\\Temp`). Two defences: the launcher ships the current validated
-build so the updater has nothing to push, and a GUI that dies no longer takes the tunnel
-with it — it is restarted once, then the VPN keeps running headless. To upgrade
-deliberately, use `./run.sh --update`, which stops everything first. Turning off
-"Automatic updates" in the GUI settings avoids the race entirely.
+Radmin's GUI can download a newer build and run its installer inside the live prefix.
+The installer closes the GUI with a normal exit code. `run.sh` treats a live
+`Radmin_VPN_*.exe` as an upgrade: it stops the tunnel, runs that installer the same
+way `--update` does (prefix and Radmin ID kept, real NDIS driver removed afterwards),
+then starts the session again. That happens when the downloaded version is not newer
+than the validated `RADMIN_VERSION`. A newer unvalidated build is stopped instead, and
+the tunnel stays up without the GUI, because opening the window again would launch the
+same installer. Closing the window yourself, with no installer running, still shuts the
+VPN down. `--update` remains the way to upgrade before connecting. A GUI crash (non-zero
+exit, no installer) still restarts the window once and otherwise leaves the tunnel up.
 
 Both `--filter-ui` and `--fix-chat` are opt-in. The filter UI needs the `rvpn_filter_ui`
 binary (built by `make`); the chat fix needs `patch_qwindows_font.py` and a Python 3 interpreter.
