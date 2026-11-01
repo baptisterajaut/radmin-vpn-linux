@@ -47,9 +47,9 @@ Other ways to run it: [from source](docs/building.md), [on NixOS](NIX.md), [on a
 
 When you open an issue, attach `~/.local/share/radmin-vpn-linux/run.log`. It contains a diagnostics block whenever the start goes wrong.
 
-**"Another app is blocking the connection. Check if you have a VPN or security program running."** On Linux that "security program" is your firewall (firewalld, ufw, nftables), and the symptom is that you can reach your friends but they can't join anything you host. Since 1.2 the launcher allows incoming traffic on the VPN adapter for the session. If the banner stays, it is another VPN or tunnel (Tailscale, WireGuard, a work VPN, a proxy like sing-box or clash): stop it, or exclude `26.0.0.0/8` from it.
+**"Another app is blocking the connection. Check if you have a VPN or security program running."** On Linux that "security program" is your firewall (firewalld, ufw, nftables), and the symptom is that you can reach your friends but they can't join anything you host. Since 1.1.1 the launcher allows incoming traffic on the VPN adapter for the session. If the banner stays, it is another VPN or tunnel (Tailscale, WireGuard, a work VPN, a proxy like sing-box or clash): stop it, or exclude `26.0.0.0/8` from it.
 
-**Radmin closes by itself.** Two known causes. Someone sent you a chat message: fixed by default since 1.2, update. Or Radmin's own updater installed a newer version inside the running prefix: run the AppImage with `--update` once, then turn off "Automatic updates" in Radmin's settings.
+**Radmin closes by itself.** Two known causes. Someone sent you a chat message: fixed by default since 1.1.1, update. Or Radmin's own updater installed a newer version inside the running prefix: run the AppImage with `--update` once, then turn off "Automatic updates" in Radmin's settings.
 
 **Radmin stays offline after an update or a restart.** Look for `Service was powered off before shutdown` in the log: Radmin remembers that you switched it off. Click the power button in the Radmin window.
 
