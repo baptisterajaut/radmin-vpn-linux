@@ -2,7 +2,7 @@
 
 This project supports NixOS out of the box using **Nix Flakes**.
 
-The packaged derivation automatically isolates the required Wine environment into `~/.local/share/radmin-vpn/wineprefix` to prevent any interference with your system or personal Wine configurations.
+The packaged derivation automatically isolates the required Wine environment into `${XDG_DATA_HOME:-~/.local/share}/radmin-vpn-linux/wineprefix` (the same prefix the AppImage uses) to prevent any interference with your system or personal Wine configurations.
 
 ## Temporary installing or testing
 

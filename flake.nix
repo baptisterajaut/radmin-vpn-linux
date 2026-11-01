@@ -7,7 +7,7 @@
   };
 
   outputs = { self, nixpkgs, utils }:
-    (utils.lib.eachDefaultSystem (system:
+    (utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
         
@@ -83,6 +83,7 @@
               pkgs.gawk
               pkgs.wget
               pkgs.iptables
+              pkgs.winetricks
             ]}"
 
             # NOTE: We use makeWrapper instead of wrapProgram here because the upstream scripts resolve BUILD_DIR via `dirname $0`.
@@ -90,23 +91,23 @@
             makeWrapper $out/share/radmin-vpn-linux/run.sh $out/bin/radmin-vpn-linux \
               --prefix PATH : "$runtimePath" \
               --suffix PATH : "/run/wrappers/bin" \
-              --run 'export WINEPREFIX="$HOME/.local/share/radmin-vpn-linux/wineprefix"'
+              --run 'export WINEPREFIX="''${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux/wineprefix"'
 
             makeWrapper $out/share/radmin-vpn-linux/run_datacenter.sh $out/bin/radmin-vpn-datacenter \
               --prefix PATH : "$runtimePath:${pkgs.lib.makeBinPath [ pkgs.x11vnc pkgs.xvfb pkgs.novnc pkgs.python3Packages.websockify ]}" \
               --suffix PATH : "/run/wrappers/bin" \
               --set NOVNC_PATH "${pkgs.novnc}/share/webapps/novnc" \
-              --run 'export WINEPREFIX="$HOME/.local/share/radmin-vpn-linux/wineprefix"'
+              --run 'export WINEPREFIX="''${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux/wineprefix"'
             
             makeWrapper $out/share/radmin-vpn-linux/run_vps.sh $out/bin/radmin-vpn-vps \
               --prefix PATH : "$runtimePath" \
               --suffix PATH : "/run/wrappers/bin" \
-              --run 'export WINEPREFIX="$HOME/.local/share/radmin-vpn-linux/wineprefix"'
+              --run 'export WINEPREFIX="''${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux/wineprefix"'
 
             makeWrapper $out/share/radmin-vpn-linux/health_check.sh $out/bin/radmin-vpn-health-check \
               --prefix PATH : "$runtimePath:${pkgs.lib.makeBinPath [ pkgs.nettools pkgs.nftables pkgs.glibc.bin ]}" \
               --suffix PATH : "/run/wrappers/bin" \
-              --run 'export WINEPREFIX="$HOME/.local/share/radmin-vpn-linux/wineprefix"'
+              --run 'export WINEPREFIX="''${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux/wineprefix"'
 
             runHook postInstall
           '';
