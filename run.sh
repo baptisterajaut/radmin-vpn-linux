@@ -84,7 +84,7 @@ DO_UPDATE="${DO_UPDATE:-0}"
 NO_BCAST_ROUTES="${NO_BCAST_ROUTES:-0}"
 
 INSTALLER_URL="${RADMIN_INSTALLER_URL:-$(radmin_installer_url)}"
-DOWNLOAD_DIR="${RADMIN_DATA_DIR:-$HOME/.local/share/radmin-vpn-linux}"
+DOWNLOAD_DIR="${RADMIN_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux}"
 
 # Find an installer, preferring the pinned build over any older .exe sitting in
 # the project dir. Downloads only as a last resort — and only when called, which

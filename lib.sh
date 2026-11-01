@@ -694,7 +694,7 @@ health_check() {
 
     echo "Checking for Radmin VPN installer..."
     local installer
-    installer=$(find . "${RADMIN_DATA_DIR:-$HOME/.local/share/radmin-vpn-linux}" \
+    installer=$(find . "${RADMIN_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux}" \
                      -maxdepth 2 -name "Radmin_VPN_*.exe" -print -quit 2>/dev/null || true)
     [ -n "$installer" ] \
         && check_pass "Installer found: $installer" \
