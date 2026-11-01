@@ -8,7 +8,7 @@ Written by a human and Claude (Anthropic), with a lot of AI-assisted reverse eng
 
 ## Audit it yourself instead of claiming it's a RAT
 
-It asks for your sudo password and runs a closed-source Windows binary, so be suspicious. Then check, it takes less time than writing the accusation.
+It asks for your sudo password in order to run a Windows program through Wine, so be suspicious of it. Then check: every line of this wrapper is open source, and it takes less time than writing the accusation. (Radmin itself is Famatech's, downloaded from them and run unmodified.)
 
 - Everything is in this repo: shell scripts and C. The release files are built by GitHub Actions from the tagged commit ([`build.yml`](.github/workflows/build.yml)), and the build logs are public. GitHub records the sha256 of each release file: `gh api repos/baptisterajaut/radmin-vpn-linux/releases/latest --jq '.assets[] | .name + " " + .digest'`.
 - `./RadminVPN-Linux-x86_64.AppImage --appimage-extract` unpacks the AppImage into `squashfs-root/`: the launch scripts in `usr/bin/`, our binaries in `usr/lib/radmin-vpn/`, and a stock Wine build ([Kron4ek](https://github.com/Kron4ek/Wine-Builds)) in `wine/`. Or skip all that and [build it yourself](docs/building.md).
