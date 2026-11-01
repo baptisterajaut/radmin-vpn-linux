@@ -153,6 +153,7 @@ radmin_installed_version() {
     [ -f "$reg" ] || return 0
     grep -a -A4 '"DisplayName"="Radmin VPN' "$reg" 2>/dev/null \
         | sed -n 's/^"DisplayVersion"="\([0-9.]*\)".*/\1/p' | head -n1
+    return 0  # no match under pipefail must not kill a set -e caller (issue #22)
 }
 
 # True when $1 is strictly newer than $2 (dotted numeric versions).
