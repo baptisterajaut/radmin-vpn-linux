@@ -103,7 +103,9 @@ int wmain(int argc, WCHAR *argv[])
     /* Also: "interface set interface XXX ENABLE" */
     /* Also: "interface ipv6 add address interface=XXX address=YYY" */
 
-    if (strstr(cmdline, "interface") &&
+    /* "interface ipv6 add address" also contains "add address": without the
+     * exclusion it lands here and valid_ipv4 rejects every IPv6 address. */
+    if (strstr(cmdline, "interface") && !strstr(cmdline, "interface ipv6") &&
         (strstr(cmdline, "add address") || strstr(cmdline, "set address"))) {
         char *p;
         /* Extract addr= or address= (use address= first for "set address") */
