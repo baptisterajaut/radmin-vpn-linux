@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # run_datacenter.sh - Radmin VPN Datacenter Edition
 # Runs on headless VPS (no display server) using Xvfb + noVNC for web-based GUI access
 # Usage: ./run_datacenter.sh [--installer /path/to/Radmin_VPN_*.exe] [--vnc-port PORT] [--web-port PORT] [--vnc-password PASS] [--web-bind ADDR]
@@ -42,7 +42,7 @@ VNC_DISPLAY=:99
 VNC_PORT=5900
 WEB_PORT=6080
 VNC_PASSWORD=""
-NOVNC_PATH=""
+NOVNC_PATH="${NOVNC_PATH:-}"
 # Web (noVNC) bind address. Default 127.0.0.1 = reachable only via SSH tunnel.
 # Pass --web-bind 0.0.0.0 to expose it publicly (only with --vnc-password!).
 WEB_BIND="127.0.0.1"

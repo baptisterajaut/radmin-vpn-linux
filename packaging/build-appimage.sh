@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Builds RadminVPN-Linux-x86_64.AppImage
 #
 # Inputs:  build/ populated with {tap_bridge, rvpn_filter_ui,

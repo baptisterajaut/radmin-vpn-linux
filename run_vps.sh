@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # run_vps.sh - Radmin VPN on Linux for VPS (headless, hardcoded GUID)
 # Starts service, waits for ready, then launches rv_net_enum.exe
 # Usage: ./run_vps.sh [--installer /path/to/Radmin_VPN_*.exe]

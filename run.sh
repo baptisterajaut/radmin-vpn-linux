@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # run.sh - Radmin VPN on Linux
 # Usage: ./run.sh [--installer /path/to/Radmin_VPN_*.exe] [--no-ui] [--update]
 #                 [--no-broadcast-routes] [--filter-ui] [--fix-chat]

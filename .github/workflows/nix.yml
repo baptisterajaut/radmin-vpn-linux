@@ -1,0 +1,22 @@
+name: Nix Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check repository
+      uses: actions/checkout@v4
+
+    - name: Install Nix
+      uses: cachix/install-nix-action@v31
+
+    - name: Run Nix Build
+      run: nix build
+    - run: test -x result/bin/radmin-vpn-linux
+    - run: test -f result/share/radmin-vpn-linux/build/rvpnnetmp.sys

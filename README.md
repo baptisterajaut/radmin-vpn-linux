@@ -58,6 +58,9 @@ sudo pacman -S wine mingw-w64-gcc
 sudo apt install wine64 wine32 gcc-mingw-w64
 ```
 
+### NixOS
+If you are using NixOS, this project includes native support via Nix Flakes. Please refer to [NIX.md](NIX.md) for installing on NixOS instructions.
+
 ## Source quick start
 
 ```bash
