@@ -375,21 +375,8 @@ sleep 1
 boot_wineserver
 
 # ── 11. Start netsh relay ──
-rm -f "$CMD_FILE" "${CMD_FILE}.proc"
-(
-    while true; do
-        if [ -f "$CMD_FILE" ]; then
-            mv "$CMD_FILE" "${CMD_FILE}.proc" 2>/dev/null || continue
-            while IFS= read -r cmd; do
-                cmd=$(printf '%s' "$cmd" | tr -d '\r')
-                [ -z "$cmd" ] && continue
-                sudo sh -c "$cmd" 2>/dev/null
-            done < "${CMD_FILE}.proc"
-            rm -f "${CMD_FILE}.proc"
-        fi
-        sleep 0.3
-    done
-) &
+# Strict allowlist, never a shell: see netsh_relay in lib.sh.
+netsh_relay "$CMD_FILE" "$TAP_DEV" 0.3 &
 RELAY_PID=$!
 
 # ── 12. Clear old logs ──

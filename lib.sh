@@ -156,6 +156,47 @@ radmin_installed_version() {
     return 0  # no match under pipefail must not kill a set -e caller (issue #22)
 }
 
+# ---- netsh relay ----
+# netsh.exe (src/netsh_wrapper.c) cannot run Linux commands from inside Wine, so
+# it appends them to a file in /tmp and this loop runs them with sudo. Any process
+# of the user can write that file, Windows ones included (Z:\tmp), so nothing in
+# it is trusted: only the exact lines netsh_wrapper.c emits are accepted, and they
+# run as `ip` with separate arguments, never through a shell.
+netsh_relay_line() {   # $1 = line, $2 = TAP device
+    local l=$1 dev=$2
+    local v4="^ip addr add (([0-9]{1,3}\.){3}[0-9]{1,3})/([0-9]{1,2}) dev $dev 2>/dev/null; ip link set $dev up 2>/dev/null$"
+    local v6="^ip -6 addr add ([0-9a-fA-F:]+)/128 dev $dev 2>/dev/null$"
+    if [[ $l =~ $v4 ]]; then
+        sudo ip addr add "${BASH_REMATCH[1]}/${BASH_REMATCH[3]}" dev "$dev" 2>/dev/null || true
+        sudo ip link set "$dev" up 2>/dev/null || true
+    elif [[ $l =~ $v6 ]]; then
+        sudo ip -6 addr add "${BASH_REMATCH[1]}/128" dev "$dev" 2>/dev/null || true
+    elif [ "$l" = "ip link set $dev up" ]; then
+        sudo ip link set "$dev" up 2>/dev/null || true
+    elif [ "$l" = "ip addr flush dev $dev" ]; then
+        sudo ip addr flush dev "$dev" 2>/dev/null || true
+    else
+        echo "[!] netsh relay: rejected $(printf '%q' "${l:0:160}")" >&2
+    fi
+    return 0
+}
+
+netsh_relay() {   # $1 = command file, $2 = TAP device, $3 = poll interval (s)
+    local f=$1 dev=$2 cmd
+    rm -f "$f" "$f.proc"
+    while true; do
+        # -O: a file another user planted in /tmp is never read.
+        if [ -f "$f" ] && [ -O "$f" ] && mv "$f" "$f.proc" 2>/dev/null; then
+            while IFS= read -r cmd || [ -n "$cmd" ]; do
+                cmd=${cmd%$'\r'}   # Wine writes \r\n
+                [ -z "$cmd" ] || netsh_relay_line "$cmd" "$dev"
+            done < "$f.proc"
+            rm -f "$f.proc"
+        fi
+        sleep "$3"
+    done
+}
+
 # ---- Host firewall (issues #34, #35) ----
 # On Linux, Radmin's "Another app is blocking the connection" banner is the host
 # firewall dropping inbound traffic on the TAP: peers can ping out but nobody can
