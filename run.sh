@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # run.sh - Radmin VPN on Linux
 # Usage: ./run.sh [--installer /path/to/Radmin_VPN_*.exe] [--no-ui] [--update]
-#                 [--no-broadcast-routes] [--filter-ui] [--fix-chat] [--no-firewall]
+#                 [--no-broadcast-routes] [--filter-ui] [--no-fix-chat] [--no-firewall]
 #   --update     upgrade Radmin to the pinned version (lib.sh RADMIN_VERSION),
 #                reusing the prefix so the RID registered with Famatech survives
 #   --filter-ui  launch the optional GTK4 packet-filter UI (off by default)
-#   --fix-chat   patch Qt qwindows.dll to fix the chat crash (off by default)
+#   --no-fix-chat  leave Qt qwindows.dll unpatched (default: patch the chat crash)
 #   --no-firewall  leave the host firewall alone (default: accept inbound on the TAP)
 set -euo pipefail
 
@@ -65,7 +65,7 @@ FILTER_UI_PID=""
 MONITOR_PID=""
 NO_UI=0
 FILTER_UI=0
-FIX_CHAT=0
+FIX_CHAT=1
 NO_FIREWALL=0
 
 # Parse args
@@ -78,7 +78,8 @@ for arg in "$@"; do
         --no-ui) NO_UI=1 ;;
         --no-broadcast-routes) NO_BCAST_ROUTES=1 ;;
         --filter-ui) FILTER_UI=1 ;;
-        --fix-chat) FIX_CHAT=1 ;;
+        --fix-chat) FIX_CHAT=1 ;;   # now the default, kept for old command lines
+        --no-fix-chat) FIX_CHAT=0 ;;
         --no-firewall) NO_FIREWALL=1 ;;
         --update) DO_UPDATE=1 ;;
     esac
@@ -545,13 +546,18 @@ fi
 
 # Patch Qt's qwindows.dll to survive malformed font name-table offsets that Wine
 # returns for some host fonts (the chat-crash root cause). Idempotent: re-running
-# detects an already-patched dll. Opt-in via --fix-chat.
+# detects an already-patched dll. On by default (issue #31: an incoming chat
+# message closed Radmin); the dll is the same in 2.0.4899.9 and 2.1.4951.1, and the
+# patch refuses any other build. --no-fix-chat restores the original.
+QWIN="$RADMIN/platforms/qwindows.dll"
 if [ "$FIX_CHAT" -eq 1 ]; then
-    if [ -f "$DIR/patch_qwindows_font.py" ] && [ -f "$RADMIN/platforms/qwindows.dll" ]; then
-        python3 "$DIR/patch_qwindows_font.py" "$RADMIN/platforms/qwindows.dll" >/dev/null 2>&1 \
+    if [ -f "$DIR/patch_qwindows_font.py" ] && [ -f "$QWIN" ]; then
+        python3 "$DIR/patch_qwindows_font.py" "$QWIN" >/dev/null 2>&1 \
             && good "chat fix applied (qwindows.dll patched)" \
-            || warn "qwindows.dll patch failed — chat may crash"
+            || warn "qwindows.dll patch failed — chat may crash (--no-fix-chat to silence)"
     fi
+elif [ -f "$QWIN.orig" ]; then
+    mv -f "$QWIN.orig" "$QWIN" && say "--no-fix-chat: original qwindows.dll restored"
 fi
 
 # GUI launch.

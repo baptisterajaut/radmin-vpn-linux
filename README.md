@@ -95,7 +95,7 @@ On subsequent runs, just:
 | `--update` | Upgrade Radmin to the pinned version in place. Keeps the prefix, so the RID registered with Famatech survives. |
 | `--no-broadcast-routes` | Don't add the broadcast/multicast → TAP routes. |
 | `--filter-ui` | Launch the optional GTK4 packet-filter UI (off by default). |
-| `--fix-chat` | Patch Qt's `qwindows.dll` to fix the chat-window crash under Wine (off by default). |
+| `--no-fix-chat` | Don't patch Qt's `qwindows.dll`. By default it is patched, otherwise an incoming chat message crashes Radmin under Wine. |
 | `--no-firewall` | Leave the host firewall alone. By default inbound traffic on `radminvpn0` is accepted for the session (firewalld zone `trusted`, or a tagged nft/iptables rule), the usual cause of Radmin's "Another app is blocking the connection" banner on Linux. |
 
 ### Radmin's own auto-updater
@@ -108,8 +108,8 @@ with it — it is restarted once, then the VPN keeps running headless. To upgrad
 deliberately, use `./run.sh --update`, which stops everything first. Turning off
 "Automatic updates" in the GUI settings avoids the race entirely.
 
-Both `--filter-ui` and `--fix-chat` are opt-in. The filter UI needs the `rvpn_filter_ui`
-binary (built by `make`); the chat fix needs `patch_qwindows_font.py` and a Python 3 interpreter.
+`--filter-ui` is opt-in and needs the `rvpn_filter_ui` binary (built by `make`). The chat
+fix needs `patch_qwindows_font.py` and a Python 3 interpreter.
 
 ## Headless / server modes
 
