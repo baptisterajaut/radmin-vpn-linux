@@ -156,6 +156,71 @@ radmin_installed_version() {
     return 0  # no match under pipefail must not kill a set -e caller (issue #22)
 }
 
+# ---- Host firewall (issues #34, #35) ----
+# On Linux, Radmin's "Another app is blocking the connection" banner is the host
+# firewall dropping inbound traffic on the TAP: peers can ping out but nobody can
+# join a server you host. We accept inbound on the TAP for the session only:
+# runtime state, every rule tagged with FW_TAG, removed by firewall_close.
+FW_TAG="radmin-vpn-linux"
+FW_STATE=/tmp/rvpn_fw_firewalld   # firewalld zone change made by us
+
+# "family table chain" for every nft filter base chain on the input hook.
+_nft_input_chains() {
+    sudo nft list chains 2>/dev/null | awk '
+        $1 == "table" { fam = $2; tbl = $3 }
+        $1 == "chain" { ch = $2 }
+        /type filter hook input/ && fam ~ /^(ip|ip6|inet)$/ { print fam, tbl, ch }'
+}
+
+# Prints what it opened (empty when there was nothing to open).
+firewall_open() {
+    local dev=$1 fam tbl ch done=""
+    firewall_close "$dev"   # leftovers from a run killed before its cleanup
+    # firewalld owns the nft ruleset when it runs: go through its API, not nft.
+    if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
+        [ "$(sudo firewall-cmd --get-zone-of-interface="$dev" 2>/dev/null)" = "trusted" ] && return 0
+        sudo firewall-cmd --zone=trusted --change-interface="$dev" >/dev/null 2>&1 \
+            && echo "$dev" > "$FW_STATE" && echo "firewalld zone trusted"
+        return 0
+    fi
+    # nft also sees ufw and iptables-nft rules (table ip filter). An accept only
+    # ends its own base chain, so every input chain gets one.
+    if command -v nft >/dev/null 2>&1; then
+        while read -r fam tbl ch; do
+            sudo nft insert rule "$fam" "$tbl" "$ch" iifname "$dev" accept comment "\"$FW_TAG\"" \
+                >/dev/null 2>&1 && done="$done $fam/$tbl/$ch"
+        done < <(_nft_input_chains)
+    fi
+    # iptables-legacy rules are invisible to nft.
+    if command -v iptables >/dev/null 2>&1 && { ! command -v nft >/dev/null 2>&1 \
+            || iptables --version 2>/dev/null | grep -q legacy; }; then
+        sudo iptables  -I INPUT -i "$dev" -m comment --comment "$FW_TAG" -j ACCEPT 2>/dev/null && done="$done iptables"
+        sudo ip6tables -I INPUT -i "$dev" -m comment --comment "$FW_TAG" -j ACCEPT 2>/dev/null || true
+    fi
+    [ -z "$done" ] || echo "${done# }"
+}
+
+firewall_close() {
+    local dev=$1 fam tbl ch h
+    if [ -f "$FW_STATE" ]; then
+        sudo firewall-cmd --zone=trusted --remove-interface="$(cat "$FW_STATE")" >/dev/null 2>&1 || true
+        rm -f "$FW_STATE"
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        while read -r fam tbl ch; do
+            for h in $(sudo nft -a list chain "$fam" "$tbl" "$ch" 2>/dev/null \
+                    | sed -n "s/.*comment \"$FW_TAG\" # handle \([0-9]\+\).*/\1/p"); do
+                sudo nft delete rule "$fam" "$tbl" "$ch" handle "$h" >/dev/null 2>&1 || true
+            done
+        done < <(_nft_input_chains)
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        while sudo iptables  -D INPUT -i "$dev" -m comment --comment "$FW_TAG" -j ACCEPT 2>/dev/null; do :; done
+        while sudo ip6tables -D INPUT -i "$dev" -m comment --comment "$FW_TAG" -j ACCEPT 2>/dev/null; do :; done
+    fi
+    return 0
+}
+
 # True when $1 is strictly newer than $2 (dotted numeric versions).
 version_gt() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
@@ -556,6 +621,10 @@ dump_diagnostics() {
     else
         echo "  (no nft/iptables/firewalld found)"
     fi
+    local svc
+    for svc in firewalld ufw nftables iptables; do
+        systemctl is-active --quiet "$svc" 2>/dev/null && echo "  active service: $svc" || true
+    done
     if command -v nft >/dev/null 2>&1; then
         echo "  --- nft ruleset (first 40 lines, best-effort; may need root) ---"
         nft list ruleset 2>/dev/null | head -n 40 | sed 's/^/  /' || true

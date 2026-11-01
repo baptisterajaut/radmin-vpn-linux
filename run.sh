@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # run.sh - Radmin VPN on Linux
 # Usage: ./run.sh [--installer /path/to/Radmin_VPN_*.exe] [--no-ui] [--update]
-#                 [--no-broadcast-routes] [--filter-ui] [--fix-chat]
+#                 [--no-broadcast-routes] [--filter-ui] [--fix-chat] [--no-firewall]
 #   --update     upgrade Radmin to the pinned version (lib.sh RADMIN_VERSION),
 #                reusing the prefix so the RID registered with Famatech survives
 #   --filter-ui  launch the optional GTK4 packet-filter UI (off by default)
 #   --fix-chat   patch Qt qwindows.dll to fix the chat crash (off by default)
+#   --no-firewall  leave the host firewall alone (default: accept inbound on the TAP)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -65,6 +66,7 @@ MONITOR_PID=""
 NO_UI=0
 FILTER_UI=0
 FIX_CHAT=0
+NO_FIREWALL=0
 
 # Parse args
 INSTALLER=""
@@ -77,6 +79,7 @@ for arg in "$@"; do
         --no-broadcast-routes) NO_BCAST_ROUTES=1 ;;
         --filter-ui) FILTER_UI=1 ;;
         --fix-chat) FIX_CHAT=1 ;;
+        --no-firewall) NO_FIREWALL=1 ;;
         --update) DO_UPDATE=1 ;;
     esac
 done
@@ -125,6 +128,7 @@ cleanup() {
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
     [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null || true
     [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
+    [ "$NO_FIREWALL" -eq 1 ] || firewall_close "$TAP_DEV"
     sudo ip link delete "$TAP_DEV" 2>/dev/null || true
     rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b \
           /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac /tmp/rvpn_filters.json
@@ -310,6 +314,13 @@ sudo ip link set "$TAP_DEV" allmulticast on
 # the kernel may not find a matching route back, causing it to drop replies.
 sudo sysctl -w "net.ipv4.conf.$TAP_DEV.rp_filter=0" >/dev/null 2>&1 || true
 sudo sysctl -w "net.ipv4.conf.$TAP_DEV.accept_local=1" >/dev/null 2>&1 || true
+# Host firewall: accept inbound on the TAP for this session (lib.sh, #34/#35).
+if [ "$NO_FIREWALL" -eq 1 ]; then
+    say "--no-firewall: host firewall left as is"
+else
+    FW_OPENED="$(firewall_open "$TAP_DEV")"
+    [ -z "$FW_OPENED" ] || good "Firewall: inbound on $TAP_DEV accepted ($FW_OPENED) — --no-firewall to skip"
+fi
 sudo ip maddr add 224.0.2.60 dev "$TAP_DEV" 2>/dev/null || true
 # Minecraft Java "Open to LAN" announces on multicast 224.0.2.60:4445 (TTL=1).
 # With no IP_MULTICAST_IF set, the kernel picks the multicast egress interface

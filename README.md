@@ -96,6 +96,7 @@ On subsequent runs, just:
 | `--no-broadcast-routes` | Don't add the broadcast/multicast → TAP routes. |
 | `--filter-ui` | Launch the optional GTK4 packet-filter UI (off by default). |
 | `--fix-chat` | Patch Qt's `qwindows.dll` to fix the chat-window crash under Wine (off by default). |
+| `--no-firewall` | Leave the host firewall alone. By default inbound traffic on `radminvpn0` is accepted for the session (firewalld zone `trusted`, or a tagged nft/iptables rule), the usual cause of Radmin's "Another app is blocking the connection" banner on Linux. |
 
 ### Radmin's own auto-updater
 
