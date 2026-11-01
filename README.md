@@ -6,6 +6,16 @@ Run [Radmin VPN](https://www.radmin-vpn.com/) on Linux through Wine: join networ
 
 Written by a human and Claude (Anthropic), with a lot of AI-assisted reverse engineering in Ghidra. It works, with no guarantees. Not affiliated with Famatech; Radmin VPN itself is downloaded from Famatech's servers, never shipped here.
 
+## Audit it yourself instead of claiming it's a RAT
+
+It asks for your sudo password and runs a closed-source Windows binary, so be suspicious. Then check, it takes less time than writing the accusation.
+
+- Everything is in this repo: shell scripts and C. The release files are built by GitHub Actions from the tagged commit ([`build.yml`](.github/workflows/build.yml)), and the build logs are public. GitHub records the sha256 of each release file: `gh api repos/baptisterajaut/radmin-vpn-linux/releases/latest --jq '.assets[] | .name + " " + .digest'`.
+- `./RadminVPN-Linux-x86_64.AppImage --appimage-extract` unpacks the AppImage into `squashfs-root/`: the launch scripts in `usr/bin/`, our binaries in `usr/lib/radmin-vpn/`, and a stock Wine build ([Kron4ek](https://github.com/Kron4ek/Wine-Builds)) in `wine/`. Or skip all that and [build it yourself](docs/building.md).
+- What runs as root: `ip` (the `radminvpn0` adapter, its addresses and routes), `sysctl` (two settings on that adapter only), `modprobe tun`, `nmcli` (tells NetworkManager to leave the adapter alone) and `firewall-cmd`, `nft` or `iptables` (the firewall rule, removed on exit). Grep the scripts for `sudo` to check the list. Radmin's own request to configure its address goes through a relay that only accepts the exact `ip` commands it expects, never a shell.
+- What gets downloaded: the Radmin installer, from `download.radmin-vpn.com`, checked against a sha256 pinned in [`lib.sh`](lib.sh). Nothing else, unless `winetricks` is installed, which then fetches a few DirectX libraries for the GUI.
+- What Radmin itself sends is Famatech's business, not ours. For the record, reverse engineering shows that Radmin 2.1 puts "this is Wine" and your kernel version in the client information it sends.
+
 ## Install
 
 Download `RadminVPN-Linux-x86_64.AppImage` from the [latest release](https://github.com/baptisterajaut/radmin-vpn-linux/releases/latest). Wine is bundled, nothing else to install.
