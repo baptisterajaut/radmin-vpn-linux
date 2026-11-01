@@ -5,26 +5,122 @@ set -euo pipefail
 
 APPDIR="$(dirname "$(readlink -f "$0")")"
 
-# ---- If not launched from a terminal, re-exec inside one so the user sees output ----
-if [ ! -t 1 ] && [ -z "${RADMIN_IN_TERM:-}" ]; then
-    export RADMIN_IN_TERM=1
-    SELF="$(readlink -f "$0")"
-    QUOTED_ARGS="$(printf '%q ' "$@")"
-    INNER="\"$SELF\" $QUOTED_ARGS; echo; echo '[Radmin VPN — press enter to close]'; read"
-    for term in konsole xfce4-terminal mate-terminal lxterminal alacritty kitty xterm; do
-        if command -v "$term" >/dev/null 2>&1; then
-            exec "$term" -e bash -c "$INNER"
-        fi
-    done
-    if command -v gnome-terminal >/dev/null 2>&1; then
-        exec gnome-terminal --wait -- bash -c "$INNER"
-    fi
-    # No terminal emulator found — fall through, output still goes to $DATA_DIR/run.log
-fi
-
 # ---- Data dir (persistent, outside the read-only AppImage) ----
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/radmin-vpn-linux"
 mkdir -p "$DATA_DIR"
+LOG_FILE="$DATA_DIR/run.log"
+
+# ---- Askpass: native binary, else synthesize via zenity/kdialog ----
+# Exported so a re-exec below (terminal or hidden pty) reuses it and its EXIT
+# trap removes it.
+if [ -z "${SUDO_ASKPASS:-}" ] && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
+    for ap in /usr/bin/ksshaskpass /usr/bin/lxqt-openssh-askpass \
+              /usr/libexec/openssh/ssh-askpass /usr/lib/openssh/gnome-ssh-askpass3 \
+              /usr/lib/openssh/gnome-ssh-askpass /usr/lib/ssh/x11-ssh-askpass \
+              /usr/bin/ssh-askpass; do
+        [ -x "$ap" ] || continue
+        # ksshaskpass warns "Unable to parse phrase" on any non-SSH prompt — wrap to filter.
+        export ASKPASS_SHIM="$(mktemp)"
+        printf '#!/bin/bash\nexec "%s" "$@" 2> >(grep -v "Unable to parse phrase" >&2)\n' "$ap" > "$ASKPASS_SHIM"
+        chmod +x "$ASKPASS_SHIM"
+        export SUDO_ASKPASS="$ASKPASS_SHIM"
+        break
+    done
+    if [ -z "${SUDO_ASKPASS:-}" ]; then
+        export ASKPASS_SHIM="$(mktemp)"
+        if command -v zenity >/dev/null 2>&1; then
+            printf '#!/bin/sh\nzenity --password --title="Radmin VPN" --text="$1" 2>/dev/null\n' > "$ASKPASS_SHIM"
+        elif command -v kdialog >/dev/null 2>&1; then
+            printf '#!/bin/sh\nkdialog --title "Radmin VPN" --password "$1" 2>/dev/null\n' > "$ASKPASS_SHIM"
+        fi
+        if [ -s "$ASKPASS_SHIM" ]; then
+            chmod +x "$ASKPASS_SHIM"; export SUDO_ASKPASS="$ASKPASS_SHIM"
+        else
+            rm -f "$ASKPASS_SHIM"; unset ASKPASS_SHIM
+        fi
+    fi
+fi
+
+notify() { command -v notify-send >/dev/null 2>&1 && notify-send -a "Radmin VPN" "Radmin VPN" "$1" 2>/dev/null || true; }
+
+# Runs $1 (a bash command line) in the first terminal emulator found; returns
+# only when there is none.
+open_terminal() {
+    local term
+    for term in konsole xfce4-terminal mate-terminal lxterminal alacritty kitty xterm; do
+        command -v "$term" >/dev/null 2>&1 && exec "$term" -e bash -c "$1"
+    done
+    command -v gnome-terminal >/dev/null 2>&1 && exec gnome-terminal --wait -- bash -c "$1"
+    return 0
+}
+
+# ---- Not launched from a terminal: run hidden, or in a terminal when output matters ----
+# Run the AppImage from a terminal to always see the output.
+if [ ! -t 1 ] && [ -z "${RADMIN_IN_TERM:-}" ]; then
+    export RADMIN_IN_TERM=1
+    SELF="$(readlink -f "$0")"
+    QUOTED_ARGS=""; [ $# -eq 0 ] || QUOTED_ARGS="$(printf '%q ' "$@")"
+
+    SHOW_TERM=0
+    # First install: minutes of silent download + installer, people assume it hung.
+    # Same test as run.sh's install step.
+    [ -f "$DATA_DIR/wineprefix/drive_c/Program Files (x86)/Radmin VPN/RvControlSvc.exe" ] || SHOW_TERM=1
+    for a in "$@"; do
+        case "$a" in
+            --update) SHOW_TERM=1 ;;   # same as a first install
+            --no-ui)  SHOW_TERM=1 ;;   # hidden + headless = nothing left to stop it with
+        esac
+    done
+    [ -n "${SUDO_ASKPASS:-}" ] || SHOW_TERM=1   # sudo can only prompt on a tty
+    command -v script >/dev/null 2>&1 || SHOW_TERM=1
+
+    if [ "$SHOW_TERM" -eq 0 ]; then
+        # Hidden, but under an invisible pty: with no tty, sudo keys its credential
+        # cache on the parent PID (sudoers timestamp_type), so the keep-alive and
+        # every sudo in run.sh would each prompt again.
+        # CBA: a sudo in run.sh that misses the cache (timestamp_timeout=0, sudo -k
+        # mid-session) prompts on this invisible pty and hangs; probing sudo -nv
+        # after priming and falling back to a terminal is the upgrade.
+        # CBA: if the GUI crashes twice run.sh stays up headless and invisible
+        # (pkill -f run.sh to stop it); a tray icon would be the upgrade.
+        rc=0
+        # script -c runs through $SHELL (fish, zsh...): pin bash for the quoting.
+        SHELL="$(command -v bash)" script -qec "\"$SELF\" $QUOTED_ARGS" /dev/null </dev/null >/dev/null 2>&1 || rc=$?
+        case "$rc" in
+            0)  exit 0 ;;
+            75) notify "Already running."; exit 0 ;;
+        esac
+        notify "Stopped with an error, see $LOG_FILE"
+        open_terminal "tail -n 80 $(printf '%q' "$LOG_FILE"); echo; echo '[Radmin VPN stopped with an error (code $rc). Full log: $LOG_FILE. Press enter to close]'; read"
+        exit "$rc"
+    fi
+
+    open_terminal "\"$SELF\" $QUOTED_ARGS; echo; echo '[Radmin VPN — press enter to close]'; read"
+    # No terminal emulator found — fall through, output still goes to $LOG_FILE
+fi
+
+KEEPALIVE_PID=""
+cleanup() {
+    [ -n "$KEEPALIVE_PID" ] && kill "$KEEPALIVE_PID" 2>/dev/null || true
+    rm -f "${ASKPASS_SHIM:-}"
+}
+trap cleanup EXIT
+
+# ---- Single instance ----
+# Two launches race on the TAP device, the FIFOs and the wineserver. fd 9 is
+# closed for run.sh below, so wineserver (which outlives us) never holds it.
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$DATA_DIR/.lock"
+    if ! flock -n 9; then
+        echo "[-] Radmin VPN is already running." >&2
+        exit 75
+    fi
+fi
+
+# ---- Logging: duplicate output to a persistent file so GUI launches are debuggable ----
+# Truncated here, before sudo, so a hidden launch that fails on sudo shows its
+# own error rather than the previous run's log.
+: > "$LOG_FILE"
 
 # ---- Bundled wine on PATH (Kron4ek tarball, plain binaries) ----
 export PATH="$APPDIR/wine/bin:$PATH"
@@ -42,55 +138,20 @@ export RADMIN_DATA_DIR="$DATA_DIR"
 # pinned version in lib.sh (RADMIN_VERSION). Set RADMIN_INSTALLER_URL in the
 # environment to override.
 
-# ---- Askpass: native binary, else synthesize via zenity/kdialog ----
-if [ -z "${SUDO_ASKPASS:-}" ] && [ -n "${DISPLAY:-${WAYLAND_DISPLAY:-}}" ]; then
-    for ap in /usr/bin/ksshaskpass /usr/bin/lxqt-openssh-askpass \
-              /usr/libexec/openssh/ssh-askpass /usr/lib/openssh/gnome-ssh-askpass3 \
-              /usr/lib/openssh/gnome-ssh-askpass /usr/lib/ssh/x11-ssh-askpass \
-              /usr/bin/ssh-askpass; do
-        [ -x "$ap" ] || continue
-        # ksshaskpass warns "Unable to parse phrase" on any non-SSH prompt — wrap to filter.
-        ASKPASS_SHIM="$(mktemp)"
-        printf '#!/bin/bash\nexec "%s" "$@" 2> >(grep -v "Unable to parse phrase" >&2)\n' "$ap" > "$ASKPASS_SHIM"
-        chmod +x "$ASKPASS_SHIM"
-        export SUDO_ASKPASS="$ASKPASS_SHIM"
-        break
-    done
-    if [ -z "${SUDO_ASKPASS:-}" ]; then
-        ASKPASS_SHIM="$(mktemp)"
-        if command -v zenity >/dev/null 2>&1; then
-            printf '#!/bin/sh\nzenity --password --title="Radmin VPN" --text="$1" 2>/dev/null\n' > "$ASKPASS_SHIM"
-        elif command -v kdialog >/dev/null 2>&1; then
-            printf '#!/bin/sh\nkdialog --title "Radmin VPN" --password "$1" 2>/dev/null\n' > "$ASKPASS_SHIM"
-        fi
-        [ -s "$ASKPASS_SHIM" ] && { chmod +x "$ASKPASS_SHIM"; export SUDO_ASKPASS="$ASKPASS_SHIM"; }
-    fi
-fi
-
 # ---- Prime sudo + background keep-alive ----
 SUDO_PROMPT="Radmin VPN needs root for TAP device and routes. Password:"
 if [ -n "${SUDO_ASKPASS:-}" ]; then
-    sudo -A -p "$SUDO_PROMPT" -v || { echo "[-] sudo required" >&2; exit 1; }
+    sudo -A -p "$SUDO_PROMPT" -v || { echo "[-] sudo required" | tee -a "$LOG_FILE" >&2; exit 1; }
 else
     echo "[*] $SUDO_PROMPT"
     sudo -v || { echo "[-] sudo required" >&2; exit 1; }
 fi
 
-( while true; do sudo -nv 2>/dev/null || exit; sleep 50; done ) &
+( exec 9>&-; while true; do sudo -nv 2>/dev/null || exit; sleep 50; done ) &
 KEEPALIVE_PID=$!
 
 export RADMIN_SUDO_PRIMED=1   # tells run.sh to skip its own sudo -v
 
-# ---- Logging: duplicate output to a persistent file so GUI launches are debuggable ----
-LOG_FILE="$DATA_DIR/run.log"
-: > "$LOG_FILE"
-
-cleanup() {
-    kill "$KEEPALIVE_PID" 2>/dev/null || true
-    rm -f "${ASKPASS_SHIM:-}"
-}
-trap cleanup EXIT
-
 # ---- Run ----
-bash "$APPDIR/usr/bin/run.sh" "$@" 2>&1 | tee -a "$LOG_FILE"
+bash "$APPDIR/usr/bin/run.sh" "$@" 9>&- 2>&1 | tee -a "$LOG_FILE"
 # cleanup() fires via EXIT trap

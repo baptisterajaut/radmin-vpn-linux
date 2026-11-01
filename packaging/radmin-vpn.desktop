@@ -5,6 +5,6 @@ GenericName=VPN Client
 Comment=Radmin VPN (Windows) on Linux via Wine
 Exec=AppRun
 Icon=radmin-vpn
-Terminal=true
+Terminal=false
 Categories=Network;
 StartupWMClass=RvRvpnGui.exe

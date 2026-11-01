@@ -25,7 +25,7 @@ chmod +x RadminVPN-Linux-x86_64.AppImage
 ./RadminVPN-Linux-x86_64.AppImage
 ```
 
-On first launch it downloads the Radmin VPN installer it is validated against (or pass your own with `--installer`). A terminal opens with progress, and one sudo password prompt is needed for TAP setup.
+On first launch it downloads the Radmin VPN installer it is validated against (or pass your own with `--installer`). A terminal opens with progress, and one sudo password prompt is needed for TAP setup. Later launches start without a terminal (a graphical password prompt only); if Radmin stops with an error, a terminal opens on the log. Start the AppImage from a terminal to always see the output.
 
 Persistent state (wineprefix, MAC, logs) lives in `~/.local/share/radmin-vpn-linux/`.
 
