@@ -262,6 +262,48 @@ firewall_close() {
     return 0
 }
 
+# Session start, for ufw_report's journal window. Set when lib.sh is sourced.
+RVPN_RUN_START=$(date '+%Y-%m-%d %H:%M:%S')
+
+# ufw is on by default on CachyOS, deny incoming (its installer runs `ufw default
+# deny incoming; ufw enable`, #39). firewall_open covers the TAP; this prints what
+# ufw still dropped on the other interfaces during the session, so a report shows
+# which interface and port Radmin needed. Read-only, sudo -n: never prompts at exit.
+# CBA: kernel log from journald only; on a system without it the block list is empty.
+ufw_report() {
+    local dev=$1 status blocks
+    command -v ufw >/dev/null 2>&1 || return 0
+    status=$(sudo -n env LC_ALL=C ufw status verbose 2>/dev/null) || return 0
+    printf '%s\n' "$status" | grep -q '^Status: active' || return 0
+    warn "ufw active — $(printf '%s\n' "$status" | grep -E '^(Default|Logging):' | tr '\n' ' ')"
+    if printf '%s\n' "$status" | grep -q '^Logging: off'; then
+        echo "    ufw logging is off: blocked packets are not visible (sudo ufw logging low)"
+        return 0
+    fi
+    blocks=$(sudo -n journalctl -k -q --no-pager --since "$RVPN_RUN_START" 2>/dev/null \
+        | awk -v dev="$dev" '/UFW BLOCK/ {
+            iface = src = proto = dpt = ""
+            for (i = 1; i <= NF; i++) {
+                split($i, kv, "=")
+                if (kv[1] == "IN") iface = kv[2]
+                else if (kv[1] == "SRC") src = kv[2]
+                else if (kv[1] == "PROTO") proto = kv[2]
+                else if (kv[1] == "DPT") dpt = kv[2]
+            }
+            if (iface == dev) next
+            from = (src ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|f[cd]|fe80:)/) ? "lan" : "internet"
+            n[iface " " proto " port " (dpt == "" ? "-" : dpt) " from " from]++
+        }
+        END { for (k in n) printf "%8d  %s\n", n[k], k }' | sort -rn | head -n 15) || true
+    if [ -n "$blocks" ]; then
+        echo "    blocked incoming this session, outside $dev (count, interface, protocol, port, source):"
+        printf '%s\n' "$blocks"
+    else
+        echo "    nothing blocked outside $dev this session"
+    fi
+    return 0
+}
+
 # True when $1 is strictly newer than $2 (dotted numeric versions).
 version_gt() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]

@@ -133,6 +133,7 @@ cleanup() {
     sudo ip link delete "$TAP_DEV" 2>/dev/null || true
     rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b \
           /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac /tmp/rvpn_filters.json
+    ufw_report "$TAP_DEV" || true   # after the teardown: a failure here must not skip it
     # Collect a debug bundle of everything captured this run.
     if [ "${RVPN_DEBUG:-0}" = "1" ]; then
         BUND="/tmp/rvpn_debug_$(date +%Y%m%d_%H%M%S)"
