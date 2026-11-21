@@ -56,6 +56,7 @@ export MALLOC_ARENA_MAX=2
 RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
 BUILD_DIR="${BUILD_DIR:-$DIR/build}"
 TAP_DEV="radminvpn0"
+TAP_MTU="${TAP_MTU:-1300}"
 CMD_FILE="/tmp/radmin_netsh_cmd"
 LOG="$WINEPREFIX/drive_c/ProgramData/Famatech/Radmin VPN/service.log"
 MAC_FILE="$WINEPREFIX/radmin_mac"
@@ -308,6 +309,7 @@ sudo modprobe tun 2>/dev/null || true
 sudo ip link delete "$TAP_DEV" 2>/dev/null || true
 sudo ip tuntap add dev "$TAP_DEV" mode tap user "$(whoami)"
 sudo ip link set "$TAP_DEV" address "$ADAPTER_MAC"
+sudo ip link set "$TAP_DEV" mtu "$TAP_MTU"
 sudo ip link set "$TAP_DEV" up
 # Enable multicast support for IGMP/Minecraft LAN
 sudo ip link set "$TAP_DEV" multicast on
@@ -522,6 +524,7 @@ good "Adapter ready — VPN IP: $vpn_ip"
 
 if [ -n "$vpn_ip" ]; then
     sudo ip addr add "$vpn_ip/8" dev "$TAP_DEV" 2>/dev/null || true
+    sudo ip link set "$TAP_DEV" mtu "$TAP_MTU" 2>/dev/null || true
     sudo ip link set "$TAP_DEV" up 2>/dev/null || true
 fi
 sudo ip route replace 26.0.0.0/8 dev "$TAP_DEV"

@@ -13,6 +13,7 @@ export WINEPREFIX="$DIR/wineprefix"
 RADMIN="$WINEPREFIX/drive_c/Program Files (x86)/Radmin VPN"
 BUILD_DIR="$DIR/build"
 TAP_DEV="radminvpn0"
+TAP_MTU="${TAP_MTU:-1300}"
 CMD_FILE="/tmp/radmin_netsh_cmd"
 LOG="$WINEPREFIX/drive_c/ProgramData/Famatech/Radmin VPN/service.log"
 MAC_FILE="$WINEPREFIX/radmin_mac"
@@ -127,6 +128,7 @@ say "Creating TAP device..."
 sudo ip link delete "$TAP_DEV" 2>/dev/null || true
 sudo ip tuntap add dev "$TAP_DEV" mode tap user "$(whoami)"
 sudo ip link set "$TAP_DEV" address "$ADAPTER_MAC"
+sudo ip link set "$TAP_DEV" mtu "$TAP_MTU"
 sudo ip link set "$TAP_DEV" up
 # Enable multicast support for IGMP/Minecraft LAN
 sudo ip link set "$TAP_DEV" multicast on
@@ -258,6 +260,7 @@ sleep 2
 if [ -n "$vpn_ip" ]; then
     # Explicitly assign the VPN IP (fallback if netsh_wrapper wasn't invoked)
     sudo ip addr add "$vpn_ip/8" dev "$TAP_DEV" 2>/dev/null || true
+    sudo ip link set "$TAP_DEV" mtu "$TAP_MTU" 2>/dev/null || true
     sudo ip link set "$TAP_DEV" up 2>/dev/null || true
     good "TAP IP: $vpn_ip/8"
 fi
