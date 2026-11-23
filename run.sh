@@ -479,59 +479,6 @@ _svc_winedebug="-all"
     exec wine rvpn_launcher.exe /run
 ) > /tmp/radmin_service.log 2>&1 &
 
-say "Waiting for service to become ready..."
-SERVICE_START=$(date +%s)
-for _ in $(seq 1 60); do
-    sleep 0.5
-    if [ -f "$LOG" ]; then
-        log_txt=$(iconv -f UTF-16LE -t UTF-8 "$LOG" 2>/dev/null || true)
-        # Radmin VPN 1.4 registers the adapter but never reaches "ready" under
-        # our shim — detect early and bail with a clear message.
-        if printf '%s' "$log_txt" | grep -qE 'Service version: *1\.4'; then
-            ver=$(printf '%s' "$log_txt" | grep -oE 'Service version: *[0-9.]+' | head -n1)
-            echo ""
-            echo "[-] Unsupported version ($ver). Use Radmin VPN 2.0.x or later."
-            echo "    ./run.sh --update      # upgrades in place, keeps your prefix and RID"
-            exit 1
-        fi
-        vpn_ip=$(printf '%s' "$log_txt" | python3 -c "
-import sys, re
-lines = sys.stdin.read().strip().split('\n')
-has_ready = any('adapter ready' in l for l in lines)
-if has_ready:
-    for l in reversed(lines):
-        if 'Registered as' in l or ('IP:' in l and '0.0.0.0' not in l):
-            m = re.search(r'26\.\d+\.\d+\.\d+', l)
-            if m: print(m.group()); break
-" 2>/dev/null)
-        if [ -n "$vpn_ip" ]; then
-            break
-        fi
-    fi
-    pgrep -f RvControlSvc >/dev/null || {
-        dump_diagnostics "Service started then died (waited $(( $(date +%s) - SERVICE_START ))s)"
-        die "service exited"
-    }
-done
-
-if [ -z "${vpn_ip:-}" ]; then
-    dump_diagnostics "Service alive but never became ready (timed out after $(( $(date +%s) - SERVICE_START ))s)"
-    die "Service never reported ready — see diagnostics above."
-fi
-good "Adapter ready — VPN IP: $vpn_ip"
-
-if [ -n "$vpn_ip" ]; then
-    sudo ip addr add "$vpn_ip/8" dev "$TAP_DEV" 2>/dev/null || true
-    sudo ip link set "$TAP_DEV" up 2>/dev/null || true
-fi
-sudo ip route replace 26.0.0.0/8 dev "$TAP_DEV"
-good "Route: 26.0.0.0/8 → $TAP_DEV"
-if [ "$NO_BCAST_ROUTES" = "0" ]; then
-    sudo ip route append 255.255.255.255/32 dev "$TAP_DEV" metric 0 2>/dev/null || true
-    sudo ip route append 224.0.0.0/4        dev "$TAP_DEV" metric 0 2>/dev/null || true
-    good "Routes: broadcast + multicast IPv4 → $TAP_DEV (--no-broadcast-routes to skip)"
-fi
-
 # Patch Qt's qwindows.dll to survive malformed font name-table offsets that Wine
 # returns for some host fonts (the chat-crash root cause). Idempotent: re-running
 # detects an already-patched dll. On by default (issue #31: an incoming chat
@@ -587,9 +534,96 @@ start_gui() {
     fi
     GUI_PID=$!
 }
-if [ "$NO_UI" -eq 0 ]; then
+
+# VPN IP once the service log shows "adapter ready", empty before that.
+read_vpn_ip() {
+    printf '%s' "$1" | python3 -c "
+import sys, re
+lines = sys.stdin.read().strip().split('\n')
+has_ready = any('adapter ready' in l for l in lines)
+if has_ready:
+    for l in reversed(lines):
+        if 'Registered as' in l or ('IP:' in l and '0.0.0.0' not in l):
+            m = re.search(r'26\.\d+\.\d+\.\d+', l)
+            if m: print(m.group()); break
+" 2>/dev/null
+}
+
+say "Waiting for service to become ready..."
+SERVICE_START=$(date +%s)
+POWERED_OFF=0
+vpn_ip=""
+for _ in $(seq 1 60); do
+    sleep 0.5
+    if [ -f "$LOG" ]; then
+        log_txt=$(iconv -f UTF-16LE -t UTF-8 "$LOG" 2>/dev/null || true)
+        # Radmin VPN 1.4 registers the adapter but never reaches "ready" under
+        # our shim — detect early and bail with a clear message.
+        if printf '%s' "$log_txt" | grep -qE 'Service version: *1\.4'; then
+            ver=$(printf '%s' "$log_txt" | grep -oE 'Service version: *[0-9.]+' | head -n1)
+            echo ""
+            echo "[-] Unsupported version ($ver). Use Radmin VPN 2.0.x or later."
+            echo "    ./run.sh --update      # upgrades in place, keeps your prefix and RID"
+            exit 1
+        fi
+        vpn_ip=$(read_vpn_ip "$log_txt")
+        if [ -n "$vpn_ip" ]; then
+            break
+        fi
+        # Radmin persists its power switch: switched off last time, it stays off
+        # and never reaches "ready" until someone clicks the power button (#37).
+        if grep -q 'powered off before shutdown' <<< "$log_txt"; then
+            POWERED_OFF=1
+            break
+        fi
+    fi
+    pgrep -f RvControlSvc >/dev/null || {
+        dump_diagnostics "Service started then died (waited $(( $(date +%s) - SERVICE_START ))s)"
+        die "service exited"
+    }
+done
+
+# Powered off: the button lives in the GUI, so start it now instead of after
+# "ready", then wait for the user to switch Radmin on — no timeout.
+if [ -z "${vpn_ip:-}" ] && [ "$POWERED_OFF" -eq 1 ]; then
+    [ "$NO_UI" -eq 0 ] || die "Radmin is switched off and --no-ui has no power button. Run once without --no-ui and switch it on."
+    warn "Radmin is switched off (it remembers that from last time) — click the power button in the Radmin window"
     say "Starting GUI..."
     start_gui
+    # CBA: any GUI exit here ends the session, even a crash the main loop below
+    # would restart once; switch on first, crash-tolerance applies after.
+    while [ -z "$vpn_ip" ]; do
+        sleep 1
+        kill -0 "$GUI_PID" 2>/dev/null || die "GUI closed before Radmin was switched on"
+        pgrep -f RvControlSvc >/dev/null || {
+            dump_diagnostics "Service died while switched off"
+            die "service exited"
+        }
+        vpn_ip=$(read_vpn_ip "$(iconv -f UTF-16LE -t UTF-8 "$LOG" 2>/dev/null || true)")
+    done
+fi
+
+if [ -z "${vpn_ip:-}" ]; then
+    dump_diagnostics "Service alive but never became ready (timed out after $(( $(date +%s) - SERVICE_START ))s)"
+    die "Service never reported ready — see diagnostics above."
+fi
+good "Adapter ready — VPN IP: $vpn_ip"
+
+if [ -n "$vpn_ip" ]; then
+    sudo ip addr add "$vpn_ip/8" dev "$TAP_DEV" 2>/dev/null || true
+    sudo ip link set "$TAP_DEV" up 2>/dev/null || true
+fi
+sudo ip route replace 26.0.0.0/8 dev "$TAP_DEV"
+good "Route: 26.0.0.0/8 → $TAP_DEV"
+if [ "$NO_BCAST_ROUTES" = "0" ]; then
+    sudo ip route append 255.255.255.255/32 dev "$TAP_DEV" metric 0 2>/dev/null || true
+    sudo ip route append 224.0.0.0/4        dev "$TAP_DEV" metric 0 2>/dev/null || true
+    good "Routes: broadcast + multicast IPv4 → $TAP_DEV (--no-broadcast-routes to skip)"
+fi
+
+if [ "$NO_UI" -eq 0 ]; then
+    # Already running if it was started early to reach the power button.
+    [ -n "$GUI_PID" ] || { say "Starting GUI..."; start_gui; }
 else
     say "--no-ui: GUI not launched (service runs headless)"
 fi
