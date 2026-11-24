@@ -239,7 +239,11 @@ static volatile LONG g_icmp_tx = 0;   /* service → TAP (inbound ICMP) */
  * overlapped ReadFile IRP queued at the exact moment a frame arrives (e.g.
  * during burst traffic between ReadFile re-issue and IRP enqueue). 256 slots
  * (~410 KB per active handle) prevents burst packet loss ("RX unicast no IRP")
- * while keeping each handle's traffic strictly isolated. */
+ * while keeping each handle's traffic strictly isolated.
+ *
+ * Up to MAX_FO_RINGS (64) concurrent handles get a ring; past 64 handles,
+ * allocation returns NULL and those extra handles fall back to the legacy
+ * drop-when-no-IRP behavior (direct IRP delivery still works normally). */
 #define RX_RING_SIZE 256
 #define RX_FRAME_MAX 1600
 #define MAX_FO_RINGS 64
@@ -552,6 +556,18 @@ static BOOLEAN rx_claim_irp(PIRP irp)
     return FALSE;
 }
 
+static int peer_route_has_fo_locked(PFILE_OBJECT fo)
+{
+    if (!g_peer_routes || !fo) return 0;
+    LONG rc = g_peer_route_count;
+    if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
+    for (LONG r = 0; r < rc; r++) {
+        if (g_peer_routes[r].fo == fo)
+            return 1;
+    }
+    return 0;
+}
+
 static RX_RING *fo_ring_find_locked(PFILE_OBJECT fo)
 {
     for (LONG i = 0; i < MAX_FO_RINGS; i++) {
@@ -561,15 +577,17 @@ static RX_RING *fo_ring_find_locked(PFILE_OBJECT fo)
     return NULL;
 }
 
-static RX_RING *fo_ring_get_or_alloc(PFILE_OBJECT fo)
+static RX_RING *fo_ring_get_or_alloc(PFILE_OBJECT fo, int require_peer_route)
 {
     if (!fo) return NULL;
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
     RX_RING *existing = fo_ring_find_locked(fo);
-    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-    if (existing)
+    if (existing || (require_peer_route && !peer_route_has_fo_locked(fo))) {
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
         return existing;
+    }
+    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
     RX_RING *fresh = (RX_RING *)ExAllocatePoolWithTag(
         NonPagedPool, sizeof(RX_RING), FO_RING_TAG);
@@ -586,6 +604,14 @@ static RX_RING *fo_ring_get_or_alloc(PFILE_OBJECT fo)
         ExFreePoolWithTag(fresh, FO_RING_TAG);
         return existing;
     }
+    /* Re-verify the peer route is still live after dropping the lock for
+     * allocation: if DispatchClose ran in that window, never insert a ring
+     * for a closed FILE_OBJECT (it would never be freed). */
+    if (require_peer_route && !peer_route_has_fo_locked(fo)) {
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+        ExFreePoolWithTag(fresh, FO_RING_TAG);
+        return NULL;
+    }
     for (LONG i = 0; i < MAX_FO_RINGS; i++) {
         if (g_fo_rings[i].fo == NULL) {
             g_fo_rings[i].fo = fo;
@@ -594,6 +620,7 @@ static RX_RING *fo_ring_get_or_alloc(PFILE_OBJECT fo)
             return fresh;
         }
     }
+    /* Past MAX_FO_RINGS concurrent handles, fall back to legacy drop-when-no-IRP. */
     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
     ExFreePoolWithTag(fresh, FO_RING_TAG);
     drv_log("FO ring table full");
@@ -616,18 +643,6 @@ static void fo_ring_enqueue_locked(RX_RING *ring, const UCHAR *frameBuf, USHORT 
     ring->frames[slot].len = frameLen;
     ring->write_idx++;
     InterlockedIncrement(&g_ring_enqueued);
-}
-
-static int peer_route_has_fo_locked(PFILE_OBJECT fo)
-{
-    if (!g_peer_routes || !fo) return 0;
-    LONG rc = g_peer_route_count;
-    if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
-    for (LONG r = 0; r < rc; r++) {
-        if (g_peer_routes[r].fo == fo)
-            return 1;
-    }
-    return 0;
 }
 
 static PIRP rx_pop_claim_irp_locked(PFILE_OBJECT target_fo)
@@ -805,7 +820,7 @@ static void __stdcall rx_thread_proc(PVOID context)
                         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
                     } else {
                         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-                        ring = fo_ring_get_or_alloc(target_fo);
+                        fo_ring_get_or_alloc(target_fo, 1);
                         KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
                         found = rx_pop_claim_irp_locked(target_fo);
                         if (found) {
@@ -813,6 +828,7 @@ static void __stdcall rx_thread_proc(PVOID context)
                             complete_read_irp(found, frameBuf, frameLen);
                             InterlockedIncrement(&g_irp_completed);
                         } else {
+                            ring = fo_ring_find_locked(target_fo);
                             if (ring && peer_route_has_fo_locked(target_fo))
                                 fo_ring_enqueue_locked(ring, frameBuf, frameLen);
                             KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
@@ -1317,7 +1333,7 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     PFILE_OBJECT fo = irpSp->FileObject;
-    RX_RING *ring = fo_ring_get_or_alloc(fo);
+    RX_RING *ring = fo_ring_get_or_alloc(fo, 0);
 
     PUCHAR outBuf = NULL;
     if (Irp->MdlAddress)
