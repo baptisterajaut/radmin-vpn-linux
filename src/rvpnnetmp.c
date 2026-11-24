@@ -233,24 +233,37 @@ static int classify_high_priority(const UCHAR *frame, USHORT len)
 static volatile LONG g_icmp_rx = 0;   /* TAP → service (outbound ICMP) */
 static volatile LONG g_icmp_tx = 0;   /* service → TAP (inbound ICMP) */
 
-/* ============ RX ring buffer + pending IRP ============ */
+/* ============ Per-FILE_OBJECT RX ring buffers + pending IRP ============ */
 
-/* RX_RING is a fallback used only when no overlapped ReadFile IRP is pending.
- * In steady state with a running service every frame is delivered via IRP, so
- * the ring is almost always empty — 16 slots (~26 KB) is more than enough. */
-#define RX_RING_SIZE 16
+/* Per-handle RX_RING fallback used whenever a target FILE_OBJECT has no
+ * overlapped ReadFile IRP queued at the exact moment a frame arrives (e.g.
+ * during burst traffic between ReadFile re-issue and IRP enqueue). 256 slots
+ * (~410 KB per active handle) prevents burst packet loss ("RX unicast no IRP")
+ * while keeping each handle's traffic strictly isolated.
+ *
+ * Up to MAX_FO_RINGS (64) concurrent handles get a ring; past 64 handles,
+ * allocation returns NULL and those extra handles fall back to the legacy
+ * drop-when-no-IRP behavior (direct IRP delivery still works normally). */
+#define RX_RING_SIZE 256
 #define RX_FRAME_MAX 1600
+#define MAX_FO_RINGS 64
+#define FO_RING_TAG  'qRvR'
 
 typedef struct _RX_RING {
-    volatile ULONG write_idx;
-    volatile ULONG read_idx;
+    ULONG write_idx;
+    ULONG read_idx;
     struct {
         USHORT len;
         UCHAR  data[RX_FRAME_MAX];
     } frames[RX_RING_SIZE];
 } RX_RING;
 
-static RX_RING g_rx_ring;
+typedef struct _FO_RX_ENTRY {
+    PFILE_OBJECT fo;
+    RX_RING     *ring;
+} FO_RX_ENTRY;
+
+static FO_RX_ENTRY g_fo_rings[MAX_FO_RINGS];
 
 /* ============ IRP queue (replaces single pending IRP slot) ============
  * The service issues overlapped ReadFile calls. Each creates an IRP.
@@ -543,6 +556,126 @@ static BOOLEAN rx_claim_irp(PIRP irp)
     return FALSE;
 }
 
+static int peer_route_has_fo_locked(PFILE_OBJECT fo)
+{
+    if (!g_peer_routes || !fo) return 0;
+    LONG rc = g_peer_route_count;
+    if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
+    for (LONG r = 0; r < rc; r++) {
+        if (g_peer_routes[r].fo == fo)
+            return 1;
+    }
+    return 0;
+}
+
+static RX_RING *fo_ring_find_locked(PFILE_OBJECT fo)
+{
+    for (LONG i = 0; i < MAX_FO_RINGS; i++) {
+        if (g_fo_rings[i].fo == fo)
+            return g_fo_rings[i].ring;
+    }
+    return NULL;
+}
+
+static RX_RING *fo_ring_get_or_alloc(PFILE_OBJECT fo, int require_peer_route)
+{
+    if (!fo) return NULL;
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+    RX_RING *existing = fo_ring_find_locked(fo);
+    if (existing || (require_peer_route && !peer_route_has_fo_locked(fo))) {
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+        return existing;
+    }
+    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+    RX_RING *fresh = (RX_RING *)ExAllocatePoolWithTag(
+        NonPagedPool, sizeof(RX_RING), FO_RING_TAG);
+    if (!fresh) {
+        drv_log("FO ring alloc failed");
+        return NULL;
+    }
+    RtlZeroMemory(fresh, sizeof(RX_RING));
+
+    KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+    existing = fo_ring_find_locked(fo);
+    if (existing) {
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+        ExFreePoolWithTag(fresh, FO_RING_TAG);
+        return existing;
+    }
+    /* Re-verify the peer route is still live after dropping the lock for
+     * allocation: if DispatchClose ran in that window, never insert a ring
+     * for a closed FILE_OBJECT (it would never be freed). */
+    if (require_peer_route && !peer_route_has_fo_locked(fo)) {
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+        ExFreePoolWithTag(fresh, FO_RING_TAG);
+        return NULL;
+    }
+    for (LONG i = 0; i < MAX_FO_RINGS; i++) {
+        if (g_fo_rings[i].fo == NULL) {
+            g_fo_rings[i].fo = fo;
+            g_fo_rings[i].ring = fresh;
+            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+            return fresh;
+        }
+    }
+    /* Past MAX_FO_RINGS concurrent handles, fall back to legacy drop-when-no-IRP. */
+    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+    ExFreePoolWithTag(fresh, FO_RING_TAG);
+    drv_log("FO ring table full");
+    return NULL;
+}
+
+static void fo_ring_enqueue_locked(RX_RING *ring, const UCHAR *frameBuf, USHORT frameLen)
+{
+    if (!ring || frameLen == 0 || frameLen > RX_FRAME_MAX)
+        return;
+    if (ring->write_idx - ring->read_idx >= RX_RING_SIZE) {
+        InterlockedIncrement(&g_ring_dropped);
+        static LONG drops = 0;
+        if (InterlockedIncrement(&drops) <= 3)
+            drv_log("RX ring full, drop");
+        return;
+    }
+    ULONG slot = ring->write_idx % RX_RING_SIZE;
+    RtlCopyMemory(ring->frames[slot].data, frameBuf, frameLen);
+    ring->frames[slot].len = frameLen;
+    ring->write_idx++;
+    InterlockedIncrement(&g_ring_enqueued);
+}
+
+static PIRP rx_pop_claim_irp_locked(PFILE_OBJECT target_fo)
+{
+    while (g_irp_queue.Count > 0) {
+        PIRP cand = NULL;
+        LONG keep_n = 0;
+        for (LONG i = 0; i < g_irp_queue.Count; i++) {
+            LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
+            if (!cand && g_irp_queue.FileObjs[idx] == target_fo) {
+                cand = g_irp_queue.Irps[idx];
+            } else {
+                g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
+                g_compact_keep_fos[keep_n]  = g_irp_queue.FileObjs[idx];
+                keep_n++;
+            }
+        }
+        for (LONG i = 0; i < keep_n; i++) {
+            g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
+            g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
+        }
+        g_irp_queue.Head  = 0;
+        g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;
+        g_irp_queue.Count = keep_n;
+
+        if (!cand)
+            return NULL;
+        if (rx_claim_irp(cand))
+            return cand;
+    }
+    return NULL;
+}
+
 static void __stdcall rx_thread_proc(PVOID context)
 {
     HANDLE fifo = (HANDLE)context;
@@ -604,139 +737,133 @@ static void __stdcall rx_thread_proc(PVOID context)
          * PEERMAC IOCTL registered which FILE_OBJECT handles which MAC.
          * Group-addressed frames (broadcast FF:..:FF and any IPv4/IPv6
          * multicast — bit 0 of the first MAC byte is the group bit) go to
-         * one IRP per handle. */
+         * every active handle (completing an IRP immediately if pending,
+         * otherwise buffering into that handle's per-FO RX ring). */
         {
             KIRQL oldIrql;
             KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
-            if (g_irp_queue.Count > 0) {
-                UCHAR *dstMac = frameBuf;  /* first 6 bytes = ethernet dest MAC */
-                int is_group = (frameLen >= 1 && (dstMac[0] & 0x01));
 
-                /* Find the right FILE_OBJECT for unicast.
-                 * Slots with fo == NULL were released by DispatchClose and
-                 * will be reused by the next PEERMAC; skip them here. */
-                PFILE_OBJECT target_fo = NULL;
-                if (!is_group && frameLen >= 6 && g_peer_routes) {
-                    LONG rc = g_peer_route_count;
-                    if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
-                    for (LONG r = 0; r < rc; r++) {
-                        if (g_peer_routes[r].fo != NULL &&
+            UCHAR *dstMac = frameBuf;  /* first 6 bytes = ethernet dest MAC */
+            int is_group = (frameLen >= 1 && (dstMac[0] & 0x01));
+
+            /* Find the right FILE_OBJECT for unicast. */
+            PFILE_OBJECT target_fo = NULL;
+            int has_routes = 0;
+            if (g_peer_routes) {
+                LONG rc = g_peer_route_count;
+                if (rc > g_peer_routes_capacity) rc = g_peer_routes_capacity;
+                for (LONG r = 0; r < rc; r++) {
+                    if (g_peer_routes[r].fo != NULL) {
+                        has_routes = 1;
+                        if (!is_group && frameLen >= 6 &&
                             RtlCompareMemory(g_peer_routes[r].mac, dstMac, 6) == 6) {
                             target_fo = g_peer_routes[r].fo;
                             break;
                         }
                     }
                 }
+            }
 
-                if (is_group) {
-                    /* Group address: deliver to one IRP per unique FILE_OBJECT.
-                     * Two-pass partition into picked[] (to be completed) and
-                     * keep_*[] (to be re-installed) avoids the read-then-write
-                     * aliasing that the in-place compaction had when Head != 0
-                     * and the circular index wrapped past freshly written slots. */
-                    LONG picked_n = 0;
-                    LONG seen_n = 0;
-                    LONG keep_n = 0;
+            if (is_group) {
+                LONG picked_n = 0;
+                LONG seen_n = 0;
 
-                    for (LONG i = 0; i < g_irp_queue.Count; i++) {
-                        LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
-                        PFILE_OBJECT fo = g_irp_queue.FileObjs[idx];
-                        int already = 0;
-                        for (LONG s = 0; s < seen_n; s++) {
-                            if (g_compact_seen[s] == fo) { already = 1; break; }
-                        }
-                        if (!already && seen_n < IRP_QUEUE_SIZE) {
-                            g_compact_seen[seen_n++] = fo;
-                            g_compact_picked[picked_n++] = g_irp_queue.Irps[idx];
-                        } else {
-                            g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
-                            g_compact_keep_fos[keep_n]  = fo;
-                            keep_n++;
-                        }
+                for (LONG i = 0; i < MAX_FO_RINGS; i++) {
+                    PFILE_OBJECT fo = g_fo_rings[i].fo;
+                    if (!fo) continue;
+                    int already = 0;
+                    for (LONG s = 0; s < seen_n; s++) {
+                        if (g_compact_seen[s] == fo) { already = 1; break; }
                     }
-                    for (LONG i = 0; i < keep_n; i++) {
-                        g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
-                        g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
+                    if (!already && seen_n < IRP_QUEUE_SIZE)
+                        g_compact_seen[seen_n++] = fo;
+                }
+                for (LONG i = 0; i < g_irp_queue.Count; i++) {
+                    LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
+                    PFILE_OBJECT fo = g_irp_queue.FileObjs[idx];
+                    if (!fo) continue;
+                    int already = 0;
+                    for (LONG s = 0; s < seen_n; s++) {
+                        if (g_compact_seen[s] == fo) { already = 1; break; }
                     }
-                    g_irp_queue.Head  = 0;
-                    g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;  /* wrap: keep_n can == IRP_QUEUE_SIZE */
-                    g_irp_queue.Count = keep_n;
+                    if (!already && seen_n < IRP_QUEUE_SIZE)
+                        g_compact_seen[seen_n++] = fo;
+                }
+
+                for (LONG s = 0; s < seen_n; s++) {
+                    PFILE_OBJECT fo = g_compact_seen[s];
+                    PIRP irp = rx_pop_claim_irp_locked(fo);
+                    if (irp) {
+                        g_compact_picked[picked_n++] = irp;
+                    } else {
+                        RX_RING *ring = fo_ring_find_locked(fo);
+                        if (ring)
+                            fo_ring_enqueue_locked(ring, frameBuf, frameLen);
+                    }
+                }
+                KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+                for (LONG i = 0; i < picked_n; i++) {
+                    complete_read_irp(g_compact_picked[i], frameBuf, frameLen);
+                    InterlockedIncrement(&g_irp_completed);
+                }
+            } else if (target_fo) {
+                PIRP found = rx_pop_claim_irp_locked(target_fo);
+                if (found) {
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-
-                    /* Safe to read g_compact_picked[] without the lock here:
-                     * only the RX thread (single instance) writes it, and we
-                     * don't loop back to ZwReadFile until completion is done. */
-                    for (LONG i = 0; i < picked_n; i++) {
-                        /* Claim ownership before completing; if the cancel
-                         * routine already took it, skip — it will complete it. */
-                        if (rx_claim_irp(g_compact_picked[i])) {
-                            complete_read_irp(g_compact_picked[i], frameBuf, frameLen);
-                            InterlockedIncrement(&g_irp_completed);
-                        }
-                    }
-                } else if (target_fo) {
-                    /* Unicast: find first IRP from matching FILE_OBJECT.
-                     * Same two-pass partition so we never read a slot that
-                     * a previous iteration already overwrote. */
-                    PIRP found = NULL;
-                    LONG keep_n = 0;
-                    for (LONG i = 0; i < g_irp_queue.Count; i++) {
-                        LONG idx = (g_irp_queue.Head + i) % IRP_QUEUE_SIZE;
-                        if (!found && g_irp_queue.FileObjs[idx] == target_fo) {
-                            found = g_irp_queue.Irps[idx];
-                        } else {
-                            g_compact_keep_irps[keep_n] = g_irp_queue.Irps[idx];
-                            g_compact_keep_fos[keep_n]  = g_irp_queue.FileObjs[idx];
-                            keep_n++;
-                        }
-                    }
-                    for (LONG i = 0; i < keep_n; i++) {
-                        g_irp_queue.Irps[i]     = g_compact_keep_irps[i];
-                        g_irp_queue.FileObjs[i] = g_compact_keep_fos[i];
-                    }
-                    g_irp_queue.Head  = 0;
-                    g_irp_queue.Tail  = keep_n % IRP_QUEUE_SIZE;  /* wrap: keep_n can == IRP_QUEUE_SIZE */
-                    g_irp_queue.Count = keep_n;
-                    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-
-                    if (found) {
-                        if (rx_claim_irp(found)) {
+                    complete_read_irp(found, frameBuf, frameLen);
+                    InterlockedIncrement(&g_irp_completed);
+                } else {
+                    RX_RING *ring = fo_ring_find_locked(target_fo);
+                    if (ring) {
+                        fo_ring_enqueue_locked(ring, frameBuf, frameLen);
+                        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+                    } else {
+                        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+                        fo_ring_get_or_alloc(target_fo, 1);
+                        KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+                        found = rx_pop_claim_irp_locked(target_fo);
+                        if (found) {
+                            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
                             complete_read_irp(found, frameBuf, frameLen);
                             InterlockedIncrement(&g_irp_completed);
+                        } else {
+                            ring = fo_ring_find_locked(target_fo);
+                            if (ring && peer_route_has_fo_locked(target_fo))
+                                fo_ring_enqueue_locked(ring, frameBuf, frameLen);
+                            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
                         }
-                    } else {
-                        static LONG udrop = 0;
-                        if (InterlockedIncrement(&udrop) <= 3)
-                            drv_log("RX unicast no IRP");
                     }
+                }
+            } else if (!has_routes) {
+                /* Startup before any PEERMAC: deliver to first active handle */
+                PFILE_OBJECT fallback_fo = NULL;
+                for (LONG i = 0; i < MAX_FO_RINGS; i++) {
+                    if (g_fo_rings[i].fo != NULL) { fallback_fo = g_fo_rings[i].fo; break; }
+                }
+                if (!fallback_fo && g_irp_queue.Count > 0)
+                    fallback_fo = g_irp_queue.FileObjs[g_irp_queue.Head];
+
+                PIRP found = fallback_fo ? rx_pop_claim_irp_locked(fallback_fo) : NULL;
+                if (found) {
+                    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+                    complete_read_irp(found, frameBuf, frameLen);
+                    InterlockedIncrement(&g_irp_completed);
                 } else {
-                    /* No route — drop */
-                    static LONG ndrop = 0;
-                    if (InterlockedIncrement(&ndrop) <= 3)
-                        drv_log("RX no route");
+                    RX_RING *ring = fallback_fo ? fo_ring_find_locked(fallback_fo) : NULL;
+                    if (ring)
+                        fo_ring_enqueue_locked(ring, frameBuf, frameLen);
                     KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
                 }
-                continue;
+            } else {
+                /* No route — drop */
+                static LONG ndrop = 0;
+                if (InterlockedIncrement(&ndrop) <= 3)
+                    drv_log("RX no route");
+                KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
             }
-            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-        }
-
-        /* No pending IRP — fall back to ring buffer */
-        ULONG widx = g_rx_ring.write_idx;
-        ULONG ridx = g_rx_ring.read_idx;
-        if (widx - ridx >= RX_RING_SIZE) {
-            InterlockedIncrement(&g_ring_dropped);
-            static LONG drops = 0;
-            if (InterlockedIncrement(&drops) <= 3)
-                drv_log("RX ring full, drop");
             continue;
         }
-
-        ULONG slot = widx % RX_RING_SIZE;
-        RtlCopyMemory(g_rx_ring.frames[slot].data, frameBuf, frameLen);
-        g_rx_ring.frames[slot].len = frameLen;
-        InterlockedIncrement((volatile LONG *)&g_rx_ring.write_idx);
-        InterlockedIncrement(&g_ring_enqueued);
     }
 
     /* Log diagnostic counters at exit */
@@ -849,6 +976,7 @@ static NTSTATUS NTAPI DispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     if (fo) {
         KIRQL oldIrql;
         LONG freed = 0;
+        RX_RING *ring_to_free = NULL;
         KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
         for (LONG i = 0; i < g_peer_route_count; i++) {
             if (g_peer_routes[i].fo == fo) {
@@ -860,8 +988,19 @@ static NTSTATUS NTAPI DispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         while (g_peer_route_count > 0 &&
                g_peer_routes[g_peer_route_count - 1].fo == NULL)
             g_peer_route_count--;
+        for (LONG i = 0; i < MAX_FO_RINGS; i++) {
+            if (g_fo_rings[i].fo == fo) {
+                ring_to_free = g_fo_rings[i].ring;
+                g_fo_rings[i].fo = NULL;
+                g_fo_rings[i].ring = NULL;
+                break;
+            }
+        }
         LONG wm = g_peer_route_count;
         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+        if (ring_to_free)
+            ExFreePoolWithTag(ring_to_free, FO_RING_TAG);
 
         if (freed > 0) {
             char buf[48] = "CLOSE freed=";
@@ -1192,43 +1331,55 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         return STATUS_DEVICE_NOT_CONNECTED;
     }
 
-    ULONG ridx = g_rx_ring.read_idx;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    PFILE_OBJECT fo = irpSp->FileObject;
+    RX_RING *ring = fo_ring_get_or_alloc(fo, 0);
 
-    if (ridx < g_rx_ring.write_idx) {
-        /* Frames available — TLV-encode as many as fit in the buffer */
-        PUCHAR outBuf = NULL;
-        if (Irp->MdlAddress)
-            outBuf = (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+    PUCHAR outBuf = NULL;
+    if (Irp->MdlAddress)
+        outBuf = (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
 
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
+
+    if (ring && ring->read_idx < ring->write_idx) {
+        /* Frames available in this handle's RX ring — TLV-encode as many as fit */
         if (!outBuf) {
+            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
             Irp->IoStatus.Status = STATUS_SUCCESS;
             Irp->IoStatus.Information = 0;
             IoCompleteRequest(Irp, IO_NO_INCREMENT);
             return STATUS_SUCCESS;
         }
 
-        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
         ULONG bufLen = irpSp->Parameters.Read.Length;
         ULONG totalWritten = 0;
         ULONG framesReturned = 0;
 
-        while (ridx < g_rx_ring.write_idx) {
-            ULONG slot = ridx % RX_RING_SIZE;
-            USHORT frameLen = g_rx_ring.frames[slot].len;
+        while (ring->read_idx < ring->write_idx) {
+            ULONG slot = ring->read_idx % RX_RING_SIZE;
+            USHORT frameLen = ring->frames[slot].len;
 
             ULONG written = tlv_encode_frame(outBuf + totalWritten,
                                               bufLen - totalWritten,
-                                              g_rx_ring.frames[slot].data,
+                                              ring->frames[slot].data,
                                               frameLen, ext->SetupMode);
-            if (written == 0)
-                break;  /* no more room */
+            if (written == 0) {
+                if (framesReturned == 0) {
+                    /* Single frame larger than caller buffer — discard to avoid wedging ring */
+                    ring->read_idx++;
+                    InterlockedIncrement(&g_ring_dropped);
+                }
+                break;
+            }
 
             totalWritten += written;
-            InterlockedIncrement((volatile LONG *)&g_rx_ring.read_idx);
+            ring->read_idx++;
             InterlockedIncrement(&g_ring_consumed);
-            ridx++;
             framesReturned++;
         }
+
+        KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
 
         static LONG read_ok = 0;
         LONG rc = InterlockedIncrement(&read_ok);
@@ -1247,59 +1398,52 @@ static NTSTATUS NTAPI DispatchRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         return STATUS_SUCCESS;
     }
 
-    /* Ring empty — queue IRP for async completion by RX thread.
-     * The service uses overlapped I/O, so ReadFile returns STATUS_PENDING
-     * immediately. Wine's wineserver delivers the completion when we
-     * call IoCompleteRequest later from the RX thread. */
+    /* Ring empty — queue IRP for async completion by RX thread while still
+     * holding g_irp_queue.Lock so no frame can race between empty check and enqueue. */
     IoMarkIrpPending(Irp);
 
-    {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
-        if (g_irp_queue.Count >= IRP_QUEUE_SIZE) {
-            /* Queue full — drop oldest IRP. Logged because reaching capacity is
-             * the gate for the compaction Tail-wrap (Finding 2); if this never
-             * fires under load, that path is not in play. */
-            LONG qf = InterlockedIncrement(&g_queue_full_drops);
-            PIRP oldIrp = g_irp_queue.Irps[g_irp_queue.Head];
-            g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
-            g_irp_queue.Count--;
-            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-            if (qf <= 5 || (qf % 100) == 0) {
-                char buf[32] = "IRP queue full #";
-                hex32(buf + 16, (ULONG)qf);
-                buf[24] = 0;
-                drv_log(buf);
-            }
-            if (rx_claim_irp(oldIrp)) {
-                oldIrp->IoStatus.Status = STATUS_CANCELLED;
-                oldIrp->IoStatus.Information = 0;
-                IoCompleteRequest(oldIrp, IO_NO_INCREMENT);
-            }
-            KeAcquireSpinLock(&g_irp_queue.Lock, &oldIrql);
-        }
-        {
-            PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
-            g_irp_queue.FileObjs[g_irp_queue.Tail] = sp->FileObject;
-        }
-        g_irp_queue.Irps[g_irp_queue.Tail] = Irp;
-        g_irp_queue.Tail = (g_irp_queue.Tail + 1) % IRP_QUEUE_SIZE;
-        g_irp_queue.Count++;
+    PIRP dropped_old_irp = NULL;
+    LONG qf = 0;
+    if (g_irp_queue.Count >= IRP_QUEUE_SIZE) {
+        qf = InterlockedIncrement(&g_queue_full_drops);
+        dropped_old_irp = g_irp_queue.Irps[g_irp_queue.Head];
+        g_irp_queue.Head = (g_irp_queue.Head + 1) % IRP_QUEUE_SIZE;
+        g_irp_queue.Count--;
+    }
 
-        /* Arm the cancel routine, then run the textbook enqueue race guard: if
-         * the IRP was already cancelled before we armed, reclaim ownership and
-         * complete it here; otherwise a later cancel goes through the routine.
-         * IoSetCancelRoutine is a lock-free exchange, safe under the queue lock. */
-        IoSetCancelRoutine(Irp, RvpnCancelRoutine);
-        if (Irp->Cancel && IoSetCancelRoutine(Irp, NULL) != NULL) {
-            dequeue_specific_irp_locked(Irp);
-            KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
-            Irp->IoStatus.Status = STATUS_CANCELLED;
-            Irp->IoStatus.Information = 0;
-            IoCompleteRequest(Irp, IO_NO_INCREMENT);
-            return STATUS_PENDING;
-        }
+    g_irp_queue.FileObjs[g_irp_queue.Tail] = fo;
+    g_irp_queue.Irps[g_irp_queue.Tail] = Irp;
+    g_irp_queue.Tail = (g_irp_queue.Tail + 1) % IRP_QUEUE_SIZE;
+    g_irp_queue.Count++;
+
+    IoSetCancelRoutine(Irp, RvpnCancelRoutine);
+    if (Irp->Cancel && IoSetCancelRoutine(Irp, NULL) != NULL) {
+        dequeue_specific_irp_locked(Irp);
         KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+        if (dropped_old_irp && rx_claim_irp(dropped_old_irp)) {
+            dropped_old_irp->IoStatus.Status = STATUS_CANCELLED;
+            dropped_old_irp->IoStatus.Information = 0;
+            IoCompleteRequest(dropped_old_irp, IO_NO_INCREMENT);
+        }
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_PENDING;
+    }
+    KeReleaseSpinLock(&g_irp_queue.Lock, oldIrql);
+
+    if (dropped_old_irp) {
+        if (qf <= 5 || (qf % 100) == 0) {
+            char buf[32] = "IRP queue full #";
+            hex32(buf + 16, (ULONG)qf);
+            buf[24] = 0;
+            drv_log(buf);
+        }
+        if (rx_claim_irp(dropped_old_irp)) {
+            dropped_old_irp->IoStatus.Status = STATUS_CANCELLED;
+            dropped_old_irp->IoStatus.Information = 0;
+            IoCompleteRequest(dropped_old_irp, IO_NO_INCREMENT);
+        }
     }
 
     static LONG pend_count = 0;
@@ -1471,6 +1615,14 @@ static VOID NTAPI Unload(PDRIVER_OBJECT DriverObject)
         g_peer_routes_capacity = 0;
     }
 
+    for (LONG i = 0; i < MAX_FO_RINGS; i++) {
+        if (g_fo_rings[i].ring) {
+            ExFreePoolWithTag(g_fo_rings[i].ring, FO_RING_TAG);
+            g_fo_rings[i].ring = NULL;
+            g_fo_rings[i].fo = NULL;
+        }
+    }
+
     /* Flush and close log file */
     {
         KIRQL oldIrql;
@@ -1511,7 +1663,7 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Registry
     deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 
     RtlZeroMemory(deviceObject->DeviceExtension, sizeof(DEVICE_EXTENSION));
-    RtlZeroMemory(&g_rx_ring, sizeof(g_rx_ring));
+    RtlZeroMemory(g_fo_rings, sizeof(g_fo_rings));
     g_DeviceObject = deviceObject;
     KeInitializeSpinLock(&g_irp_queue.Lock);
     KeInitializeSpinLock(&g_log_lock);
