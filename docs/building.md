@@ -62,6 +62,14 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build mak
 sha256sum build/*
 ```
 
+The AppImage builds in the same image, after `make`:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/src -w /src rvpn-build ./packaging/build-appimage.sh
+```
+
+`build-appimage.sh` still fetches the newest Kron4ek Wine and the `continuous` `appimagetool`, so two AppImages match only if both resolve to the same builds. Pre-populate `packaging/dist/wine-runtime` and `packaging/dist/appimagetool` to rebuild a specific one.
+
 Compare the hashes with the files in the release tarball. A build on the host with a different compiler works fine but won't match. Releases up to v1.1.2 were built before this image existed, so a rebuild of those won't match them.
 
 ## Building the AppImage

@@ -17,13 +17,10 @@ jobs:
       - name: Build binaries
         run: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build make
 
-      - name: Install AppImage deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick file
-
       - name: Build AppImage
-        run: ./packaging/build-appimage.sh
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e GITHUB_TOKEN \
+            -v "$PWD":/src -w /src rvpn-build ./packaging/build-appimage.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

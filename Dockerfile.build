@@ -1,6 +1,7 @@
 # Pinned build environment for reproducible release binaries.
 #   docker build -f Dockerfile.build -t rvpn-build .
 #   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build make
+#   docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/src -w /src rvpn-build ./packaging/build-appimage.sh
 #
 # The base image is pinned by digest and the package archive by snapshot date, so
 # rebuilding an old tag later gets the same compilers. Bump both together when you
@@ -20,4 +21,5 @@ RUN apt-get update \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
         make gcc pkg-config gcc-mingw-w64 libgtk-4-dev upx-ucl \
+        curl file xz-utils imagemagick libmagickcore-7.q16-10-extra fonts-urw-base35 \
  && rm -rf /var/lib/apt/lists/*
