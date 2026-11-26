@@ -60,7 +60,10 @@ jobs:
           path: .
 
       - name: Package tarball
-        run: tar czf radmin-vpn-linux-${{ github.ref_name }}.tar.gz -C build .
+        run: |
+          # Fixed time, owner, mode and order, so the tarball can be rebuilt byte for byte.
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --mode=0644 \
+            -cf - -C build $(ls build) | gzip -n > radmin-vpn-linux-${{ github.ref_name }}.tar.gz
 
       - name: Create release
         uses: softprops/action-gh-release@v2
