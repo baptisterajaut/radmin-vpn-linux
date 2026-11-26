@@ -142,10 +142,15 @@ chmod +x "$APPDIR/AppRun"
 cp "$PACK/radmin-vpn.desktop" "$APPDIR/radmin-vpn.desktop"
 cp "$PACK/radmin-vpn.desktop" "$APPDIR/usr/share/applications/"
 
-# Icon: rasterize SVG → PNG
-convert -background none -resize 256x256 "$PACK/radmin-vpn.svg" "$APPDIR/radmin-vpn.png"
+# Icon: rasterize SVG → PNG. exclude-chunk drops the date text chunks, which would
+# otherwise put the build time (and the SVG's mtime) into the PNG.
+convert -background none -resize 256x256 -define png:exclude-chunk=date,time "$PACK/radmin-vpn.svg" "$APPDIR/radmin-vpn.png"
 cp "$APPDIR/radmin-vpn.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/"
 cp "$APPDIR/radmin-vpn.png" "$APPDIR/.DirIcon"
+
+# Fixed mtimes for everything we added. squashfs stores every file and directory time,
+# so build-time mtimes change the AppImage hash. Wine keeps the times from its tarball.
+find "$APPDIR" -not -path "$APPDIR/wine/*" -exec touch -h -d @0 {} +
 
 # ---- Package ----
 echo "[*] Running appimagetool..."
