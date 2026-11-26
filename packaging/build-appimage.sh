@@ -34,30 +34,26 @@ cd "$DIST"
 # Why Kron4ek: plain wine binaries, no path patching, no runtime hooks. wow64 variant runs
 # 32-bit PEs inside a 64-bit process (no need for host lib32). Matches the staging build
 # used for development, proven to work with Radmin's multi-process spawn pattern.
+# Pinned by version and sha256, so a rebuild bundles the same Wine and a replaced upstream
+# asset stops the build. To update, bump both from the release page (they must go together).
+WINE_VERSION="11.22"
+WINE_SHA256="eafe530ccdc188ffb00ee8dae962f16b29ff0602953b73b23c9ad3394286381a"
 WINE_DIR="$DIST/wine-runtime"
-if [ ! -d "$WINE_DIR" ] || [ -L "$WINE_DIR" ]; then
-    rm -rf "$WINE_DIR" "$DIST/wine-extract-work"
+# Records which pinned version the extracted dir holds. It lives next to the dir, not in it,
+# because everything in the dir is copied into the AppImage. A dir without a matching
+# marker (for instance one left by an older version of this script) is fetched again.
+WINE_MARKER="$DIST/wine-runtime.version"
+if [ ! -d "$WINE_DIR" ] || [ -L "$WINE_DIR" ] || [ "$(cat "$WINE_MARKER" 2>/dev/null)" != "$WINE_VERSION" ]; then
+    rm -rf "$WINE_DIR" "$WINE_MARKER" "$DIST/wine-extract-work"
 
-    echo "[*] Resolving latest Kron4ek/Wine-Builds staging-amd64-wow64..."
-    # Authenticate when a token is present (CI sets GITHUB_TOKEN): the anonymous
-    # api.github.com limit is 60 req/h/IP and shared runners exhaust it.
-    gh_auth=()
-    [ -n "${GITHUB_TOKEN:-}" ] && gh_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-    # Query the releases *list*, NOT /releases/latest — "latest" is now a
-    # proton-flavored build that ships no staging asset. Take the newest release
-    # carrying a staging-amd64-wow64 tarball. Fetch and parse are split so an API
-    # failure is reported cleanly; the old `curl -f | grep | head` under pipefail
-    # both masked the guard below and could SIGPIPE-abort spuriously.
-    releases_json=$(curl -fsSL "${gh_auth[@]}" \
-        'https://api.github.com/repos/Kron4ek/Wine-Builds/releases?per_page=20') \
-        || { echo "[-] GitHub API request failed (rate limited?)"; exit 1; }
-    # here-string, not `printf | grep`: grep -m1 exits after the first match and
-    # would SIGPIPE an upstream printf (broken pipe → pipefail abort).
-    WINE_URL=$(grep -m1 -oE '"browser_download_url": *"[^"]*staging-amd64-wow64\.tar\.xz"' \
-        <<<"$releases_json" | sed 's/.*"\(https[^"]*\)"/\1/')
-    [ -n "$WINE_URL" ] || { echo "[-] Could not resolve Kron4ek wine URL"; exit 1; }
-    echo "[*] Downloading $WINE_URL"
-    curl -fL -o wine.tar.xz "$WINE_URL"
+    echo "[*] Downloading Wine $WINE_VERSION..."
+    curl -fL -o wine.tar.xz \
+        "https://github.com/Kron4ek/Wine-Builds/releases/download/$WINE_VERSION/wine-$WINE_VERSION-staging-amd64-wow64.tar.xz"
+    if [ "$(sha256sum wine.tar.xz | cut -d' ' -f1)" != "$WINE_SHA256" ]; then
+        echo "[-] wine.tar.xz does not match the pinned sha256 for Wine $WINE_VERSION"
+        rm -f wine.tar.xz
+        exit 1
+    fi
 
     echo "[*] Extracting wine tarball..."
     WORK="$DIST/wine-extract-work"
@@ -74,15 +70,40 @@ if [ ! -d "$WINE_DIR" ] || [ -L "$WINE_DIR" ]; then
     fi
     mv "$EXTRACTED" "$WINE_DIR"
     rm -rf "$WORK"
+    echo "$WINE_VERSION" > "$WINE_MARKER"
 fi
 
 # ---- Fetch appimagetool ----
+# Pinned to a numbered release by sha256 (bump both together). It is checked on every run
+# because the file is cached in packaging/dist.
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 APPIMAGETOOL="$DIST/appimagetool"
 if [ ! -x "$APPIMAGETOOL" ]; then
-    echo "[*] Downloading appimagetool..."
+    echo "[*] Downloading appimagetool $APPIMAGETOOL_VERSION..."
     curl -fL -o "$APPIMAGETOOL" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+        "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
     chmod +x "$APPIMAGETOOL"
+fi
+if [ "$(sha256sum "$APPIMAGETOOL" | cut -d' ' -f1)" != "$APPIMAGETOOL_SHA256" ]; then
+    echo "[-] $APPIMAGETOOL does not match the pinned sha256 (delete it to re-download)"
+    exit 1
+fi
+
+# ---- Fetch the AppImage runtime ----
+# appimagetool otherwise downloads the runtime itself, from a release that moves, and
+# the runtime is the first ~900 KB of the output. Pinned by hash: if upstream republishes
+# 'continuous' the build stops here instead of silently changing.
+RUNTIME="$DIST/runtime-x86_64"
+RUNTIME_SHA256="617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46"
+if [ ! -f "$RUNTIME" ]; then
+    echo "[*] Downloading AppImage runtime..."
+    curl -fL -o "$RUNTIME" \
+        "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64"
+fi
+if [ "$(sha256sum "$RUNTIME" | cut -d' ' -f1)" != "$RUNTIME_SHA256" ]; then
+    echo "[-] $RUNTIME does not match the pinned sha256 (delete it to re-download)"
+    exit 1
 fi
 
 # ---- Assemble AppDir ----
@@ -155,7 +176,8 @@ find "$APPDIR" -not -path "$APPDIR/wine/*" -exec touch -h -d @0 {} +
 # ---- Package ----
 echo "[*] Running appimagetool..."
 rm -f "$OUT"
-ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run --no-appstream "$APPDIR" "$OUT"
+ARCH=x86_64 "$APPIMAGETOOL" --appimage-extract-and-run --no-appstream \
+    --runtime-file "$RUNTIME" "$APPDIR" "$OUT"
 
 echo "[+] Built: $OUT"
 ls -lh "$OUT"

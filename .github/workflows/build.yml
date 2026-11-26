@@ -19,10 +19,8 @@ jobs:
 
       - name: Build AppImage
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e GITHUB_TOKEN \
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
             -v "$PWD":/src -w /src rvpn-build ./packaging/build-appimage.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
