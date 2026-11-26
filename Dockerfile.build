@@ -1,0 +1,23 @@
+# Pinned build environment for reproducible release binaries.
+#   docker build -f Dockerfile.build -t rvpn-build .
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build make
+#
+# The base image is pinned by digest and the package archive by snapshot date, so
+# rebuilding an old tag later gets the same compilers. Bump both together when you
+# want a newer toolchain.
+
+FROM --platform=linux/amd64 ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
+
+ARG SNAPSHOT=20261123T212400Z
+ENV DEBIAN_FRONTEND=noninteractive
+
+# snapshot.ubuntu.com only serves https and the base image has no CA bundle, so get
+# ca-certificates from the live archive first. It never ends up in the build output.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && sed -i "s#http://archive.ubuntu.com/ubuntu#https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}#g; s#http://security.ubuntu.com/ubuntu#https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}#g" \
+        /etc/apt/sources.list.d/ubuntu.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        make gcc pkg-config gcc-mingw-w64 libgtk-4-dev upx-ucl \
+ && rm -rf /var/lib/apt/lists/*

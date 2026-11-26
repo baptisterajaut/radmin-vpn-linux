@@ -9,6 +9,10 @@ STRIP32  = i686-w64-mingw32-strip
 STRIP64  = x86_64-w64-mingw32-strip
 STRIP_FLAGS = -s -S --strip-debug --strip-unneeded
 
+# Fixed PE timestamps, for reproducible builds.
+export SOURCE_DATE_EPOCH ?= 0
+
+
 # DDK header path differs across distros:
 #   Debian/Ubuntu:  /usr/x86_64-w64-mingw32/include/ddk
 #   Fedora/RHEL:    /usr/x86_64-w64-mingw32/sys-root/mingw/include/ddk

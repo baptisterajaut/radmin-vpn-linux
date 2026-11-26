@@ -52,6 +52,18 @@ The Wine prefix lives in `./wineprefix/` for a source run. A random adapter MAC 
 - `rvpn_reuseport.so`: LD_PRELOAD shim for `wineserver`
 - `rvpn_filter_ui`: optional GTK4 packet-filter UI
 
+## Reproducing a release
+
+The binaries in a release are built inside `Dockerfile.build`, which pins the Ubuntu base image and the package archive. To rebuild them byte for byte:
+
+```bash
+docker build -f Dockerfile.build -t rvpn-build .
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build make
+sha256sum build/*
+```
+
+Compare the hashes with the files in the release tarball. A build on the host with a different compiler works fine but won't match. Releases up to v1.1.2 were built before this image existed, so a rebuild of those won't match them.
+
 ## Building the AppImage
 
 ```bash

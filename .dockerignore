@@ -1,0 +1,3 @@
+# Dockerfile.build only installs packages. The source is bind-mounted when the image
+# runs, so nothing in the repo needs to go into the build context.
+*

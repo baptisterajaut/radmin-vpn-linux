@@ -11,13 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64 libgtk-4-dev imagemagick file
+      - name: Build the pinned build image
+        run: docker build -f Dockerfile.build -t rvpn-build .
 
       - name: Build binaries
-        run: make
+        run: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build make
+
+      - name: Install AppImage deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick file
 
       - name: Build AppImage
         run: ./packaging/build-appimage.sh
