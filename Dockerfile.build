@@ -12,12 +12,11 @@ FROM --platform=linux/amd64 ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8
 ARG SNAPSHOT=20261123T212400Z
 ENV DEBIAN_FRONTEND=noninteractive
 
-# snapshot.ubuntu.com only serves https and the base image has no CA bundle, so get
-# ca-certificates from the live archive first. It never ends up in the build output.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && sed -i "s#http://archive.ubuntu.com/ubuntu#https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}#g; s#http://security.ubuntu.com/ubuntu#https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}#g" \
         /etc/apt/sources.list.d/ubuntu.sources \
+ && echo 'APT::Architecture-Variants "amd64v3";' > /etc/apt/apt.conf.d/99variants \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
         make gcc pkg-config gcc-mingw-w64 libgtk-4-dev upx-ucl \
