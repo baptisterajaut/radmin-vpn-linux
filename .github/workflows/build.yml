@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install build deps
         run: |
@@ -25,7 +25,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: radmin-vpn-linux-binaries
           path: |
@@ -41,7 +41,7 @@ jobs:
             build/rvpn_reuseport.so
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: radmin-vpn-linux-appimage
           path: packaging/dist/RadminVPN-Linux-x86_64.AppImage
@@ -53,12 +53,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: radmin-vpn-linux-binaries
           path: build/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: radmin-vpn-linux-appimage
           path: .
@@ -67,7 +67,7 @@ jobs:
         run: tar czf radmin-vpn-linux-${{ github.ref_name }}.tar.gz -C build .
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
