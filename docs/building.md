@@ -57,15 +57,16 @@ The Wine prefix lives in `./wineprefix/` for a source run. A random adapter MAC 
 The binaries in a release are built inside `Dockerfile.build`, which pins the Ubuntu base image and the package archive. To rebuild them byte for byte:
 
 ```bash
-docker build -f Dockerfile.build -t rvpn-build .
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src rvpn-build make
+make docker-build
 sha256sum build/*
 ```
 
-The AppImage builds in the same image, after `make`:
+`make docker-build` clears `build/` first, so a build you made on the host is replaced.
+
+The AppImage builds in the same image, after `make docker-build`:
 
 ```bash
-docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/src -w /src rvpn-build ./packaging/build-appimage.sh
+make docker-appimage
 ```
 
 `build-appimage.sh` downloads Wine, `appimagetool` and the AppImage runtime at pinned versions and refuses a file whose sha256 differs. To change one, bump its version and hash together in the script.
