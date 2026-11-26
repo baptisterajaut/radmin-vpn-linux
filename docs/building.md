@@ -54,24 +54,25 @@ The Wine prefix lives in `./wineprefix/` for a source run. A random adapter MAC 
 
 ## Reproducing a release
 
-The binaries in a release are built inside `Dockerfile.build`, which pins the Ubuntu base image and the package archive. To rebuild them byte for byte:
+Releases are built inside `Dockerfile.build`, which pins the Ubuntu base image and the package archive. `build-appimage.sh` downloads Wine, `appimagetool` and the AppImage runtime at pinned versions and refuses a file whose sha256 differs. All file dates are fixed, so the output doesn't depend on when it was built.
+
+To rebuild a release, get its source (a checkout of the tag or the release's source archive) and build both parts:
 
 ```bash
-make docker-build
-sha256sum build/*
+make docker-build && make docker-appimage
 ```
 
-`make docker-build` clears `build/` first, so a build you made on the host is replaced.
+`make docker-build` clears `build/` first, so a build you made on the host is replaced. Run the two targets in separate commands as above, not as `make docker-build docker-appimage`, which runs them in parallel under `make -j`.
 
-The AppImage builds in the same image, after `make docker-build`:
+Then compare. The AppImage should match the sha256 that GitHub records for the release, and each file in `build/` the same file inside the release tarball:
 
 ```bash
-make docker-appimage
+sha256sum packaging/dist/RadminVPN-Linux-x86_64.AppImage
+gh api repos/baptisterajaut/radmin-vpn-linux/releases/tags/<tag> --jq '.assets[] | .name + " " + .digest'
+sha256sum build/*   # each one should match the same file inside the release tarball
 ```
 
-`build-appimage.sh` downloads Wine, `appimagetool` and the AppImage runtime at pinned versions and refuses a file whose sha256 differs. To change one, bump its version and hash together in the script.
-
-Compare the hashes with the files in the release tarball. A build on the host with a different compiler works fine but won't match. Releases up to v1.1.2 were built before this image existed, so a rebuild of those won't match them.
+A build on the host with a different compiler works but won't match. Releases up to v1.1.2 were built before this image existed and can't be rebuilt this way.
 
 ## Building the AppImage
 
