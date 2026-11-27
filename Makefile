@@ -9,6 +9,10 @@ STRIP32  = i686-w64-mingw32-strip
 STRIP64  = x86_64-w64-mingw32-strip
 STRIP_FLAGS = -s -S --strip-debug --strip-unneeded
 
+# Fixed PE timestamps, for reproducible builds.
+export SOURCE_DATE_EPOCH ?= 0
+
+
 # DDK header path differs across distros:
 #   Debian/Ubuntu:  /usr/x86_64-w64-mingw32/include/ddk
 #   Fedora/RHEL:    /usr/x86_64-w64-mingw32/sys-root/mingw/include/ddk
@@ -21,7 +25,9 @@ DDK_INC := $(firstword $(wildcard \
 ))
 ifeq ($(DDK_INC),)
 DDK_INC = /usr/x86_64-w64-mingw32/include/ddk
+ifeq ($(filter docker-%,$(MAKECMDGOALS)),)
 $(warning DDK headers not found in standard paths; rvpnnetmp.sys compile may fail)
+endif
 endif
 
 # Lib path also differs (Fedora: sys-root/mingw/lib)
@@ -158,4 +164,19 @@ check-build-artifacts:
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all check-deps check-build-artifacts clean install-deps install-datacenter-deps appimage post-build
+# Reproducible builds inside the pinned image (Dockerfile.build, docs/building.md).
+# Run these on the host: the image has no docker, so they do nothing inside it.
+DOCKER_IMAGE = rvpn-build
+DOCKER_RUN   = docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp \
+               -v "$(CURDIR)":/src -w /src $(DOCKER_IMAGE)
+
+docker-image:
+	docker build -f Dockerfile.build -t $(DOCKER_IMAGE) .
+
+docker-build: docker-image
+	$(DOCKER_RUN) make clean all
+
+docker-appimage: docker-image
+	$(DOCKER_RUN) ./packaging/build-appimage.sh
+
+.PHONY: all check-deps check-build-artifacts clean install-deps install-datacenter-deps appimage post-build docker-image docker-build docker-appimage
