@@ -29,6 +29,31 @@ good() { echo -e "${GREEN}[+]${NC} $1"; }    # step succeeded
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }   # non-fatal warning
 die()  { echo -e "${RED}[-]${NC} $1" >&2; exit 1; }  # fatal — prints and exits
 
+# ── Packet-filter state file ──────────────────────────────────────────────────────
+# rvpn_filter_ui writes it and tap_bridge reads it. It lives in a 0700 directory
+# the launching user owns, never at a fixed /tmp path another local user could
+# plant. Both programs take the path from RVPN_FILTER_FILE.
+filter_state_init() {
+    local dir=""
+    RVPN_FILTER_TMPDIR=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -O "$XDG_RUNTIME_DIR" ]; then
+        dir="$XDG_RUNTIME_DIR/radmin-vpn"
+        mkdir -p -m 700 "$dir" && [ -O "$dir" ] || dir=""
+    fi
+    if [ -z "$dir" ]; then
+        dir=$(mktemp -d /tmp/rvpn.XXXXXX) || die "cannot create a private directory for the filter state"
+        RVPN_FILTER_TMPDIR="$dir"
+    fi
+    export RVPN_FILTER_FILE="$dir/filters.json"
+    rm -f "$RVPN_FILTER_FILE" "$RVPN_FILTER_FILE.tmp"   # a leftover from a crashed run
+}
+
+filter_state_cleanup() {
+    [ -n "${RVPN_FILTER_FILE:-}" ] && rm -f "$RVPN_FILTER_FILE" "$RVPN_FILTER_FILE.tmp"
+    [ -n "${RVPN_FILTER_TMPDIR:-}" ] && rmdir "$RVPN_FILTER_TMPDIR" 2>/dev/null
+    return 0
+}
+
 # ── Wine version utils ──────────────────────────────────────────────────────────
 # AppImage (bundled) sets $APPIMAGE; system Wine does not.
 wine_version_str() { wine --version 2>/dev/null | head -n1; }

@@ -1,8 +1,9 @@
 /*
  * rvpn_filter_ui — GTK4 interface for managing Radmin VPN packet filter rules.
  *
- * Escreve /tmp/rvpn_filters.json a cada alteração (adicionar/remover/alternar).
- * tap_bridge verifica este arquivo e aplica os filtros em ~1s.
+ * Escreve $RVPN_FILTER_FILE a cada alteração (adicionar/remover/alternar).
+ * tap_bridge verifica este arquivo e aplica os filtros em ~1s. Esta UI não
+ * executa comandos nem toca no firewall do host.
  *
  * Compilação: gcc -Wall -O2 -o cc_filter_ui rvpn_filter_ui.c $(pkg-config --cflags --libs gtk4)
  */
@@ -12,11 +13,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <unistd.h>
 
-#define FILTER_PATH "/tmp/rvpn_filters.json"
+
+/* Path of the state file, from $RVPN_FILTER_FILE (the launcher scripts put it in
+ * a private directory). No fallback: a fixed /tmp path could be planted by
+ * another local user. */
+static const char *filter_path(void)
+{
+    const char *p = getenv("RVPN_FILTER_FILE");
+    return (p && *p) ? p : NULL;
+}
 #define MAX_ENTRIES 256
-#define INTERFACE_NAME "radminvpn0"
 
 /* ── Estado do aplicativo ── */
 
@@ -43,191 +53,17 @@ typedef struct {
 
 static app_state_t app;
 
-/* ── Gerenciamento de regras de firewall ── */
-
-static void run_command(const char *cmd)
-{
-    fprintf(stderr, "cc_filter_ui: exec: %s\n", cmd);
-    (void)system(cmd);
-}
-
-/* Limpar todas as regras de filtro rvpn */
-static void clear_all_rules(void)
-{
-    /* Remove regras iptables com comentário 'rvpn-filter' */
-    run_command("sudo iptables -L INPUT -n --line-numbers | grep 'rvpn-filter' | awk '{print $1}' | sort -rn | xargs -r -I {} sudo iptables -D INPUT {} 2>/dev/null");
-    run_command("sudo iptables -L OUTPUT -n --line-numbers | grep 'rvpn-filter' | awk '{print $1}' | sort -rn | xargs -r -I {} sudo iptables -D OUTPUT {} 2>/dev/null");
-    run_command("sudo iptables -L FORWARD -n --line-numbers | grep 'rvpn-filter' | awk '{print $1}' | sort -rn | xargs -r -I {} sudo iptables -D FORWARD {} 2>/dev/null");
-
-    /* Remove regras ebtables para filtragem de MAC */
-    run_command("sudo ebtables -L INPUT -n --line-numbers 2>/dev/null | grep 'rvpn-filter' | awk '{print $1}' | sort -rn | xargs -r -I {} sudo ebtables -D INPUT {} 2>/dev/null");
-    run_command("sudo ebtables -L OUTPUT -n --line-numbers 2>/dev/null | grep 'rvpn-filter' | awk '{print $1}' | sort -rn | xargs -r -I {} sudo ebtables -D OUTPUT {} 2>/dev/null");
-}
-
-/* Aplicar regras de bloqueio de IP */
-static void apply_ip_rules(void)
-{
-    if (!app.block_ips.enabled || app.block_ips.count == 0) {
-        return;
-    }
-    
-    for (int i = 0; i < app.block_ips.count; i++) {
-        const char *ip = app.block_ips.entries[i];
-        char cmd[512];
-        int len;
-        
-        /* iptables: bloqueia ambas as direções em radminvpn0 */
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I INPUT -i %s -s %s -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I OUTPUT -o %s -d %s -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I FORWARD -i %s -s %s -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I FORWARD -o %s -d %s -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-    }
-}
-
-/* Aplicar regras de bloqueio de MAC */
-static void apply_mac_rules(void)
-{
-    if (!app.block_macs.enabled || app.block_macs.count == 0) {
-        return;
-    }
-    
-    /* Filtragem de MAC requer ebtables ou iptables com módulo mac */
-    /* Tenta ebtables primeiro, recorre ao módulo mac do iptables */
-    if (system("which ebtables > /dev/null 2>&1") == 0) {
-        for (int i = 0; i < app.block_macs.count; i++) {
-            const char *mac = app.block_macs.entries[i];
-            char cmd[512];
-            int len;
-            
-            /* ebtables: bloqueia ambas as direções em radminvpn0 */
-            len = snprintf(cmd, sizeof(cmd), "sudo ebtables -I INPUT -i %s -s %s -j DROP --comment 'rvpn-filter'", INTERFACE_NAME, mac);
-            if (len < 0 || (size_t)len >= sizeof(cmd)) {
-                fprintf(stderr, "cc_filter_ui: command too long for MAC %s\n", mac);
-                continue;
-            }
-            run_command(cmd);
-            
-            len = snprintf(cmd, sizeof(cmd), "sudo ebtables -I OUTPUT -o %s -d %s -j DROP --comment 'rvpn-filter'", INTERFACE_NAME, mac);
-            if (len < 0 || (size_t)len >= sizeof(cmd)) {
-                fprintf(stderr, "cc_filter_ui: command too long for MAC %s\n", mac);
-                continue;
-            }
-            run_command(cmd);
-        }
-    } else {
-        /* Recurso ao iptables com módulo mac (menos preciso, funciona apenas na camada IP) */
-        fprintf(stderr, "cc_filter_ui: ebtables indisponível, filtragem de MAC limitada\n");
-        for (int i = 0; i < app.block_macs.count; i++) {
-            const char *mac = app.block_macs.entries[i];
-            char cmd[512];
-            int len;
-            
-            /* Módulo mac do iptables funciona apenas em pacotes de entrada */
-            len = snprintf(cmd, sizeof(cmd), "sudo iptables -I INPUT -i %s -m mac --mac-source %s -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, mac);
-            if (len < 0 || (size_t)len >= sizeof(cmd)) {
-                fprintf(stderr, "cc_filter_ui: command too long for MAC %s\n", mac);
-                continue;
-            }
-            run_command(cmd);
-        }
-    }
-}
-
-/* Aplicar regras de bloqueio de broadcast (UDP:4445) */
-static void apply_broadcast_rules(void)
-{
-    if (!app.block_broadcast.enabled || app.block_broadcast.count == 0) {
-        return;
-    }
-    
-    for (int i = 0; i < app.block_broadcast.count; i++) {
-        const char *ip = app.block_broadcast.entries[i];
-        char cmd[512];
-        int len;
-        
-        /* iptables: bloqueia porta UDP 4445 de/para IP específico em radminvpn0 */
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I INPUT -i %s -s %s -p udp --dport 4445 -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for broadcast IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I INPUT -i %s -d %s -p udp --sport 4445 -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for broadcast IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I OUTPUT -o %s -d %s -p udp --dport 4445 -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for broadcast IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I OUTPUT -o %s -s %s -p udp --sport 4445 -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for broadcast IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I FORWARD -i %s -s %s -p udp --dport 4445 -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for broadcast IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-        
-        len = snprintf(cmd, sizeof(cmd), "sudo iptables -I FORWARD -o %s -d %s -p udp --dport 4445 -j DROP -m comment --comment 'rvpn-filter'", INTERFACE_NAME, ip);
-        if (len < 0 || (size_t)len >= sizeof(cmd)) {
-            fprintf(stderr, "cc_filter_ui: command too long for broadcast IP %s\n", ip);
-            continue;
-        }
-        run_command(cmd);
-    }
-}
-
-/* Aplicar todas as regras de firewall */
-static void apply_firewall_rules(void)
-{
-    clear_all_rules();
-    apply_ip_rules();
-    apply_mac_rules();
-    apply_broadcast_rules();
-}
-
 /* ── Entrada/Saída JSON ── */
 
 static void write_json(void)
 {
-    FILE *f = fopen(FILTER_PATH ".tmp", "w");
-    if (!f) { perror("write_json"); return; }
+    const char *path = filter_path();
+    if (!path) return;
+    char tmp[4096];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (!f) { perror("write_json"); if (fd >= 0) close(fd); return; }
 
     fprintf(f, "{\n");
     fprintf(f, "  \"block_ips_enabled\": %s,\n", app.block_ips.enabled ? "true" : "false");
@@ -256,10 +92,7 @@ static void write_json(void)
 
     fprintf(f, "}\n");
     fclose(f);
-    rename(FILTER_PATH ".tmp", FILTER_PATH);
-    
-    /* Aplica regras de firewall após escrever a configuração */
-    apply_firewall_rules();
+    rename(tmp, path);
 }
 
 /* Analisador JSON mínimo (mesma abordagem que tap_bridge) */
@@ -305,10 +138,56 @@ static int json_str_array(const char *json, const char *key,
     return count;
 }
 
+/* Entries go into hand-written JSON that tap_bridge parses, so accept only what
+ * tap_bridge itself understands: dotted IPv4 and aa:bb:cc:dd:ee:ff. */
+static int valid_ip(const char *s)
+{
+    struct in_addr a;
+    return inet_pton(AF_INET, s, &a) == 1;
+}
+
+static int valid_mac(const char *s)
+{
+    unsigned m[6];
+    char tail;
+    return sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x%c",
+                  &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &tail) == 6
+           && strlen(s) == 17;
+}
+
+static int valid_entry(const filter_section_t *s, const char *v)
+{
+    return s == &app.block_macs ? valid_mac(v) : valid_ip(v);
+}
+
+/* Drop entries read from disk that fail validation. */
+static void prune_invalid(filter_section_t *s)
+{
+    int n = 0;
+    for (int i = 0; i < s->count; i++) {
+        if (valid_entry(s, s->entries[i])) {
+            s->entries[n++] = s->entries[i];
+        } else {
+            g_free(s->entries[i]);
+        }
+    }
+    for (int i = n; i < s->count; i++) s->entries[i] = NULL;
+    s->count = n;
+}
+
 static void load_json(void)
 {
-    FILE *f = fopen(FILTER_PATH, "r");
-    if (!f) return;
+    const char *path = filter_path();
+    if (!path) return;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+        close(fd);
+        return;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -330,6 +209,10 @@ static void load_json(void)
     app.block_broadcast.count = json_str_array(buf, "broadcast_block_ips",
                                     app.block_broadcast.entries, MAX_ENTRIES);
     free(buf);
+
+    prune_invalid(&app.block_ips);
+    prune_invalid(&app.block_macs);
+    prune_invalid(&app.block_broadcast);
 }
 
 /* ── Gerenciamento de listas ── */
@@ -445,6 +328,10 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data)
 
     const char *text = gtk_editable_get_text(GTK_EDITABLE(entry));
     if (!text || !*text) return;
+    if (!valid_entry(section, text)) {
+        fprintf(stderr, "rvpn_filter_ui: rejected invalid entry\n");
+        return;
+    }
 
     if (add_entry(section, text)) {
         gtk_editable_set_text(GTK_EDITABLE(entry), "");
@@ -586,13 +473,19 @@ static void on_activate(GtkApplication *gtk_app, gpointer user_data)
 
     /* Escreve configuração inicial se o arquivo não existir */
     struct stat st;
-    if (stat(FILTER_PATH, &st) != 0)
+    const char *path = filter_path();
+    if (path && stat(path, &st) != 0)
         write_json();
 }
 
 int main(int argc, char *argv[])
 {
     memset(&app, 0, sizeof(app));
+
+    if (!filter_path()) {
+        fprintf(stderr, "rvpn_filter_ui: RVPN_FILTER_FILE is not set; start it through run.sh\n");
+        return 1;
+    }
 
     GtkApplication *gtk_app = gtk_application_new("org.radminvpn.filterui",
                                                   G_APPLICATION_DEFAULT_FLAGS);

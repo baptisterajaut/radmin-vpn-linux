@@ -42,8 +42,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-/* ── Filter config (read from /tmp/rvpn_filters.json) ── */
-#define FILTER_PATH    "/tmp/rvpn_filters.json"
+/* ── Filter config (read from $RVPN_FILTER_FILE, a private file the launcher
+ * script creates; unset means no filtering) ── */
 #define MAX_FILTERS    256
 
 typedef struct {
@@ -390,12 +390,21 @@ static int json_str_array(const char *json, const char *key,
  * filter config happens under the write lock, keeping reader latency minimal. */
 static void load_filters_internal(void)
 {
-    struct stat st;
-    if (stat(FILTER_PATH, &st) != 0) return;
-    if (st.st_mtime == filters_mtime) return;  /* unchanged */
+    const char *path = getenv("RVPN_FILTER_FILE");
+    if (!path || !*path) return;
 
-    FILE *f = fopen(FILTER_PATH, "r");
-    if (!f) return;
+    /* No symlinks, and only a regular file we own: nobody else may feed us rules. */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+        close(fd);
+        return;
+    }
+    if (st.st_mtime == filters_mtime) { close(fd); return; }  /* unchanged */
+
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
     long sz = ftell(f);
     if (sz <= 0 || sz > 65536) { fclose(f); return; }
