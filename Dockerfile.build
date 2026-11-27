@@ -16,7 +16,6 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && sed -i "s#http://archive.ubuntu.com/ubuntu#https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}#g; s#http://security.ubuntu.com/ubuntu#https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}#g" \
         /etc/apt/sources.list.d/ubuntu.sources \
- && echo 'APT::Architecture-Variants "amd64v3";' > /etc/apt/apt.conf.d/99variants \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
         make gcc pkg-config gcc-mingw-w64 libgtk-4-dev upx-ucl \
