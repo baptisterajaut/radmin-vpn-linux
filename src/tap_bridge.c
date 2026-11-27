@@ -59,7 +59,9 @@ typedef struct {
 } filter_cfg_t;
 
 static filter_cfg_t filters;
-static time_t       filters_mtime = 0;
+/* ctime of the file last loaded. A whole-second mtime misses a second write in the
+ * same second; ctime has nanoseconds and every write or rename updates it. */
+static struct timespec filters_ctime;
 static unsigned long drop_ip = 0, drop_mac = 0, drop_bcast = 0;
 
 static pthread_rwlock_t g_filter_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -401,7 +403,8 @@ static void load_filters_internal(void)
         close(fd);
         return;
     }
-    if (st.st_mtime == filters_mtime) { close(fd); return; }  /* unchanged */
+    if (st.st_ctim.tv_sec == filters_ctime.tv_sec &&
+        st.st_ctim.tv_nsec == filters_ctime.tv_nsec) { close(fd); return; }  /* unchanged */
 
     FILE *f = fdopen(fd, "r");
     if (!f) { close(fd); return; }
@@ -429,7 +432,7 @@ static void load_filters_internal(void)
                                         (char *)tmp.broadcast_block_ips, MAX_FILTERS, 48, 48);
     free(buf);
 
-    filters_mtime = st.st_mtime;
+    filters_ctime = st.st_ctim;
     memcpy(&filters, &tmp, sizeof(filters));
     fprintf(stderr, "tap_bridge: filters loaded (ip=%d/%d mac=%d/%d bcast=%d/%d)\n",
             filters.block_ips_enabled, filters.blocked_ips_count,
