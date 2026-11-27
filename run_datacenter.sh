@@ -9,6 +9,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Shared diagnostics/health library (colors, check_*, dump_diagnostics).
 source "$DIR/lib.sh"
+filter_state_init
 
 _distro() {
     if command -v dnf      >/dev/null 2>&1; then printf 'fedora'
@@ -88,8 +89,9 @@ cleanup() {
     [ -n "$X11VNC_PID" ] && kill "$X11VNC_PID" 2>/dev/null || true
     [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
     sudo ip link delete "$TAP_DEV" 2>/dev/null || true
-    rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac /tmp/rvpn_filters.json
+    rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac
     rm -f /tmp/rvpn_vnc_password /tmp/.X${VNC_DISPLAY#:}-lock
+    filter_state_cleanup
     say "Done"
 }
 trap cleanup EXIT

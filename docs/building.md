@@ -52,6 +52,12 @@ The Wine prefix lives in `./wineprefix/` for a source run. A random adapter MAC 
 - `rvpn_reuseport.so`: LD_PRELOAD shim for `wineserver`
 - `rvpn_filter_ui`: optional GTK4 packet-filter UI
 
+## Tests
+
+```bash
+make test       # packet-filter test for tap_bridge; stop any running session first
+```
+
 ## Building the AppImage
 
 ```bash

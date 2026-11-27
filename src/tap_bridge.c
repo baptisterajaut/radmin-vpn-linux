@@ -42,8 +42,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-/* ── Filter config (read from /tmp/rvpn_filters.json) ── */
-#define FILTER_PATH    "/tmp/rvpn_filters.json"
+/* ── Filter config (read from $RVPN_FILTER_FILE, a private file the launcher
+ * script creates; unset means no filtering) ── */
 #define MAX_FILTERS    256
 
 typedef struct {
@@ -59,7 +59,9 @@ typedef struct {
 } filter_cfg_t;
 
 static filter_cfg_t filters;
-static time_t       filters_mtime = 0;
+/* ctime of the file last loaded. A whole-second mtime misses a second write in the
+ * same second; ctime has nanoseconds and every write or rename updates it. */
+static struct timespec filters_ctime;
 static unsigned long drop_ip = 0, drop_mac = 0, drop_bcast = 0;
 
 static pthread_rwlock_t g_filter_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -390,12 +392,22 @@ static int json_str_array(const char *json, const char *key,
  * filter config happens under the write lock, keeping reader latency minimal. */
 static void load_filters_internal(void)
 {
-    struct stat st;
-    if (stat(FILTER_PATH, &st) != 0) return;
-    if (st.st_mtime == filters_mtime) return;  /* unchanged */
+    const char *path = getenv("RVPN_FILTER_FILE");
+    if (!path || !*path) return;
 
-    FILE *f = fopen(FILTER_PATH, "r");
-    if (!f) return;
+    /* No symlinks, and only a regular file we own: nobody else may feed us rules. */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+        close(fd);
+        return;
+    }
+    if (st.st_ctim.tv_sec == filters_ctime.tv_sec &&
+        st.st_ctim.tv_nsec == filters_ctime.tv_nsec) { close(fd); return; }  /* unchanged */
+
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
     long sz = ftell(f);
     if (sz <= 0 || sz > 65536) { fclose(f); return; }
@@ -420,7 +432,7 @@ static void load_filters_internal(void)
                                         (char *)tmp.broadcast_block_ips, MAX_FILTERS, 48, 48);
     free(buf);
 
-    filters_mtime = st.st_mtime;
+    filters_ctime = st.st_ctim;
     memcpy(&filters, &tmp, sizeof(filters));
     fprintf(stderr, "tap_bridge: filters loaded (ip=%d/%d mac=%d/%d bcast=%d/%d)\n",
             filters.block_ips_enabled, filters.blocked_ips_count,
@@ -526,9 +538,8 @@ static int should_drop_frame(const uint8_t *frame, uint16_t len, int direction)
         }
     }
 
-    /* ── Block Broadcast (incoming only: driver→TAP) ── */
-    if (direction == 1 &&
-        filters.block_broadcast_enabled && filters.broadcast_block_ips_count > 0) {
+    /* ── Block Broadcast UDP:4445 (both directions) ── */
+    if (filters.block_broadcast_enabled && filters.broadcast_block_ips_count > 0) {
         /* Must be UDP */
         if (frame[23] != 17) return 0;
 
@@ -544,8 +555,8 @@ static int should_drop_frame(const uint8_t *frame, uint16_t len, int direction)
             if (src_port == 4445 || dst_port == 4445) {
                 drop_bcast++;
                 if (drop_bcast <= 5 || (drop_bcast % 100) == 0)
-                    fprintf(stderr, "tap_bridge: DROP bcast #%lu (ip=%u.%u.%u.%u port=%u/%u)\n",
-                            drop_bcast, src_ip[0], src_ip[1], src_ip[2], src_ip[3],
+                    fprintf(stderr, "tap_bridge: DROP bcast #%lu (dir=%s ip=%u.%u.%u.%u port=%u/%u)\n",
+                            drop_bcast, direction ? "drv→TAP" : "TAP→drv", src_ip[0], src_ip[1], src_ip[2], src_ip[3],
                             src_port, dst_port);
                 return 1;
             }

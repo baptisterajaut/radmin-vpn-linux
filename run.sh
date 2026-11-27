@@ -13,6 +13,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Shared diagnostics/health library (colors, check_*, dump_diagnostics).
 source "$DIR/lib.sh"
+filter_state_init
 
 # ── Portability helpers ───────────────────────────────────────────────────────
 
@@ -132,14 +133,14 @@ cleanup() {
     [ "$NO_FIREWALL" -eq 1 ] || firewall_close "$TAP_DEV"
     sudo ip link delete "$TAP_DEV" 2>/dev/null || true
     rm -f "$CMD_FILE" "${CMD_FILE}.proc" /tmp/rvpn_b2d /tmp/rvpn_d2b \
-          /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac /tmp/rvpn_filters.json
+          /tmp/rvpn_d2b_high /tmp/rvpn_d2b_low /tmp/rvpn_mac
     ufw_report "$TAP_DEV" || true   # after the teardown: a failure here must not skip it
     # Collect a debug bundle of everything captured this run.
     if [ "${RVPN_DEBUG:-0}" = "1" ]; then
         BUND="/tmp/rvpn_debug_$(date +%Y%m%d_%H%M%S)"
         mkdir -p "$BUND" 2>/dev/null || true
         cp /tmp/radmin_*.log "$BUND/" 2>/dev/null || true
-        cp /tmp/rvpn_filters.json "$BUND/" 2>/dev/null || true
+        cp "$RVPN_FILTER_FILE" "$BUND/" 2>/dev/null || true
         iconv -f UTF-16LE -t UTF-8 "$LOG" > "$BUND/service.log.txt" 2>/dev/null || cp "$LOG" "$BUND/service.log" 2>/dev/null || true
         cp "$WINEPREFIX/drive_c/radmin_crash.log"      "$BUND/" 2>/dev/null || true
         cp "$WINEPREFIX/drive_c/radmin_hook_debug.log" "$BUND/" 2>/dev/null || true
@@ -157,6 +158,7 @@ cleanup() {
             grep -E 'CRASH|code=0x|access-violation|  #0[0-3] ' "$WINEPREFIX/drive_c/radmin_crash.log" | tail -12
         fi
     fi
+    filter_state_cleanup   # after the debug bundle, which copies the filter file
 }
 trap cleanup EXIT
 
