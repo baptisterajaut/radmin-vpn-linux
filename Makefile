@@ -155,7 +155,13 @@ check-build-artifacts:
 	done
 	@if [ ! -f "$(BUILD)/rvpn_filter_ui" ]; then echo "[!] rvpn_filter_ui not found — will be skipped"; fi
 
+# Packet-filter test: runs tap_bridge in a throwaway namespace, no Wine or sudo needed.
+# It shares the fixed /tmp/rvpn_* FIFO paths with a live session, so refuse to run next to one.
+test: $(BUILD)/tap_bridge
+	@! pgrep -x tap_bridge >/dev/null || { echo "A Radmin session is running; stop it first (the test reuses its /tmp/rvpn_* FIFOs)"; exit 1; }
+	unshare -Urn python3 -I tests/filter_bridge_test.py $(BUILD)/tap_bridge
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all check-deps check-build-artifacts clean install-deps install-datacenter-deps appimage post-build
+.PHONY: all check-deps check-build-artifacts clean install-deps install-datacenter-deps appimage post-build test
