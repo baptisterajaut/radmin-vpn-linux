@@ -329,15 +329,25 @@ static void on_add_clicked(GtkButton *btn, gpointer user_data)
     const char *text = gtk_editable_get_text(GTK_EDITABLE(entry));
     if (!text || !*text) return;
     if (!valid_entry(section, text)) {
-        fprintf(stderr, "rvpn_filter_ui: rejected invalid entry\n");
+        fprintf(stderr, "rvpn_filter_ui: rejected invalid %s \"%.64s\" (expected %s)\n",
+                section == &app.block_macs ? "MAC" : "IP", text,
+                section == &app.block_macs ? "aa:bb:cc:dd:ee:ff" : "a.b.c.d, each 0-255");
+        gtk_widget_add_css_class(GTK_WIDGET(entry), "error");
         return;
     }
 
+    gtk_widget_remove_css_class(GTK_WIDGET(entry), "error");
     if (add_entry(section, text)) {
         gtk_editable_set_text(GTK_EDITABLE(entry), "");
         write_json();
         refresh_list(listbox, section);
     }
+}
+
+static void on_entry_changed(GtkEditable *e, gpointer user_data)
+{
+    (void)user_data;
+    gtk_widget_remove_css_class(GTK_WIDGET(e), "error");
 }
 
 static void on_entry_activate(GtkEntry *entry, gpointer user_data)
@@ -392,6 +402,7 @@ static GtkWidget *make_section(const char *title,
     gtk_entry_set_placeholder_text(ent, placeholder);
     gtk_widget_set_hexpand(GTK_WIDGET(ent), TRUE);
     g_signal_connect(ent, "activate", G_CALLBACK(on_entry_activate), section);
+    g_signal_connect(ent, "changed", G_CALLBACK(on_entry_changed), NULL);
     gtk_box_append(GTK_BOX(entry_row), GTK_WIDGET(ent));
 
     GtkWidget *add_btn = gtk_button_new_with_label("Adicionar");
