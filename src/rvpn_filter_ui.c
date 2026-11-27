@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -148,11 +149,11 @@ static int valid_ip(const char *s)
 
 static int valid_mac(const char *s)
 {
-    unsigned m[6];
-    char tail;
-    return sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x%c",
-                  &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &tail) == 6
-           && strlen(s) == 17;
+    if (strlen(s) != 17) return 0;
+    for (int i = 0; i < 17; i++) {
+        if (i % 3 == 2 ? s[i] != ':' : !isxdigit((unsigned char)s[i])) return 0;
+    }
+    return 1;
 }
 
 static int valid_entry(const filter_section_t *s, const char *v)
