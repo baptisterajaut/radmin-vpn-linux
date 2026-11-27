@@ -535,9 +535,8 @@ static int should_drop_frame(const uint8_t *frame, uint16_t len, int direction)
         }
     }
 
-    /* ── Block Broadcast (incoming only: driver→TAP) ── */
-    if (direction == 1 &&
-        filters.block_broadcast_enabled && filters.broadcast_block_ips_count > 0) {
+    /* ── Block Broadcast UDP:4445 (both directions) ── */
+    if (filters.block_broadcast_enabled && filters.broadcast_block_ips_count > 0) {
         /* Must be UDP */
         if (frame[23] != 17) return 0;
 
@@ -553,8 +552,8 @@ static int should_drop_frame(const uint8_t *frame, uint16_t len, int direction)
             if (src_port == 4445 || dst_port == 4445) {
                 drop_bcast++;
                 if (drop_bcast <= 5 || (drop_bcast % 100) == 0)
-                    fprintf(stderr, "tap_bridge: DROP bcast #%lu (ip=%u.%u.%u.%u port=%u/%u)\n",
-                            drop_bcast, src_ip[0], src_ip[1], src_ip[2], src_ip[3],
+                    fprintf(stderr, "tap_bridge: DROP bcast #%lu (dir=%s ip=%u.%u.%u.%u port=%u/%u)\n",
+                            drop_bcast, direction ? "drv→TAP" : "TAP→drv", src_ip[0], src_ip[1], src_ip[2], src_ip[3],
                             src_port, dst_port);
                 return 1;
             }
